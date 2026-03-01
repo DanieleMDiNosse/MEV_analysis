@@ -1,621 +1,368 @@
+#!/usr/bin/env python3
 """
-data_fetch.py — Uniswap v3 pool event harvester (origin separated from gas fields)
+data_fetch.py — Subgraph-first Uniswap v3 pool event harvester (RPC-minimized)
 
-Overview
---------
-This script extracts Swap, Mint, and Burn events for a single Uniswap v3 pool
-over a given time window, enriches each event with the pool's *running state*
-before/after the event, and (optionally) augments rows with on-chain gas data:
-`gasUsed`, `gasPrice`, and `effectiveGasPrice`. Results are streamed to a CSV.
-
-Key features
-------------
-- Robust, adaptive `get_logs` over large block ranges (auto-splitting on RPC limits).
-- Parallel parsing of logs.
-- **Separated metadata fetch**:
-  - Always fetch `origin` (tx.from) from `eth_getTransaction`.
-  - Optionally fetch gas fields from `eth_getTransactionReceipt` (plus legacy `gasPrice`).
-- Resume-safe checkpoints (block cursor + last known pool state).
-- Running state columns for liquidity and sqrt price before/after each event.
-
-Workflow (high level)
+What this script does
 ---------------------
-1) Convert the requested time window to block numbers via binary search.
-2) Fetch Swap/Mint/Burn logs in adaptively sized block chunks.
-3) Decode logs into event rows (base columns).
-4) **Fetch origins only** for unique `transactionHash` values.
-5) If `SKIP_GAS_DATA` is False, batch-fetch gas fields for those hashes.
-6) Walk the event sequence in block/log order to compute pool *running state*.
-7) Append rows to the CSV and persist a checkpoint.
+Fetches Swap/Mint/Burn events for a single Uniswap v3 pool over a time window,
+computes the pool *running state* before/after each event, and streams the
+result to a CSV with a resume-safe checkpoint.
 
-Configuration knobs
--------------------
-- `POOL_ADDR`: Pool address (checksum).
-- `START_TS` / `END_TS`: Time window (UNIX seconds or ISO8601 string).
-- `CHUNK_SIZE_BLOCKS`: Max block span per log request (auto-splits further on RPC limits).
-- `PARALLEL_WORKERS`: Thread fan-out for log parsing.
-- `BATCH_RECEIPT_SIZE`: Batch size for metadata lookups.
-- `SKIP_GAS_DATA`: If True, skip `gasUsed` / `effectiveGasPrice` / `gasPrice` (faster).
+Reliability strategy (why this exists)
+--------------------------------------
+Public RPC providers often rate-limit or hard-cap `eth_getLogs` queries over
+large ranges. The Uniswap v3 subgraph is typically more reliable for the *event
+list* (tx hashes, logIndex, timestamps, amounts, ticks, sqrtPriceX96, origin).
 
-Output CSV schema
------------------
-All rows share a common schema; some fields are `None` when not applicable to the
-event type. Types are Python primitives as written by pandas.
+This script therefore:
+  1) Uses the subgraph for the canonical event stream (swap/mint/burn).
+  2) Uses RPC only for fields that are not reliably stored in the subgraph but
+     are required for correctness:
+       - Swap event `liquidity` (active liquidity after the swap), decoded from
+         on-chain Swap logs via `eth_getLogs`.
+  3) Leaves gas fields empty by default (use `scripts/add_gas.py` later).
 
-Core identifiers and timing:
-- `eventType` (str): One of `"Swap"`, `"Mint"`, `"Burn"`.
-- `blockNumber` (int): Block height containing the event.
-- `logIndex` (int): Index of the log within the block (for strict ordering).
-- `timestamp` (int): Block timestamp in UNIX seconds (UTC).
-- `transactionHash` (str): Hex string of the tx hash (0x-prefixed).
+Configuration (no secrets in repo)
+---------------------------------
+Set endpoints via environment variables (recommended):
+  - UNIV3_GRAPH_URL : subgraph GraphQL endpoint
+  - MEV_RPC_URLS    : space-separated RPC endpoints (for failover)
+  - WEB3_PROVIDER_URI: single RPC endpoint fallback
 
-Gas / tx metadata:
-- `origin` (str|None): Transaction sender (`from` address). **Always fetched.**
-- `gasUsed` (int|None): Gas units actually consumed by the tx (from receipt).
-- `gasPrice` (int|None): Legacy tx gas price in wei (from tx). May be `None` for
-  EIP-1559 transactions which instead have `maxFeePerGas`/`maxPriorityFeePerGas`.
-- `effectiveGasPrice` (int|None): Actual wei paid per gas (from receipt), i.e.
-  `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)` for type-2, or `gasPrice`
-  for legacy. Use `gasUsed * effectiveGasPrice / 1e18` to get ETH spent.
+You can also pass `--graph-url` and `--rpc-urls`.
 
-Event-specific payload:
-- `sender` (str|None): For `Swap`: event `sender`. For `Mint`/`Burn`: `None`.
-- `owner` (str|None): For `Mint`/`Burn`: position owner. Else `None`.
-- `recipient` (str|None): For `Swap`: event `recipient`. Else `None`.
-- `amount0` (int):
-  * Swap: signed pool delta of token0. **Sign convention (Uniswap v3):**
-    Positive => pool received token0; Negative => pool sent token0.
-  * Mint/Burn: unsigned amount of token0 moved due to liquidity change (event field).
-- `amount1` (int):
-  * Swap: signed pool delta of token1 (same sign convention as above).
-  * Mint/Burn: unsigned amount of token1 moved due to liquidity change.
-- `sqrtPriceX96_event` (int|None): For `Swap`: the new sqrt price Q64.96 after the swap.
-  For `Mint`/`Burn`: `None`.
-- `tick_event` (int|None): For `Swap`: the new tick after the swap. Else `None`.
-- `liquidityAfter_event` (int|None): For `Swap`: pool active liquidity AFTER the swap event.
-  For `Mint`/`Burn`: `None`.
-- `tickLower` (int|None): For `Mint`/`Burn`: lower tick of the position. Else `None`.
-- `tickUpper` (int|None): For `Mint`/`Burn`: upper tick of the position. Else `None`.
-
-Running-state (derived):
-- `L_before`, `sqrt_before`, `tick_before`, `x_before`, `y_before`
-- `L_after`,  `sqrt_after`,  `tick_after`,  `x_after`,  `y_after`
-- `affectsActive` (bool|None): For Mint/Burn: whether the position spans active tick.
-- `deltaL_applied` (int|None): Liquidity change applied to active L (Mint positive, Burn negative when spanning).
+Output
+------
+CSV is written to `data/raw/univ3_<POOL>.csv` by default, with schema compatible
+with the existing MEV pipeline (e.g. `scripts/mev_collect.py`).
 """
 
-import os, json, tempfile, time
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import time
 from pathlib import Path
-from typing import Union, Optional, Dict, Any, List, Tuple
-import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
-from web3 import Web3
-from web3._utils.events import get_event_data
 from eth_defi.provider.multi_provider import create_multi_provider_web3
+from web3 import Web3
 
-# ---------------- RPC configuration ----------------
-# Do not hard-code RPC keys/secrets in the repository. Prefer environment variables:
-# - MEV_RPC_URLS: space-separated HTTPS endpoints (preferred; enables failover)
-# - WEB3_PROVIDER_URI: a single HTTPS endpoint
-#
-# If neither is set, we fall back to a small list of public endpoints (rate-limited).
+from quarantined_rpc import QuarantinedRPC
+from univ3_amounts import to_raw_units
+from univ3_checkpoint import load_checkpoint, save_checkpoint_atomic
+from univ3_rpc_swap_liquidity import fetch_swap_liquidity_map
+from univ3_subgraph_client import (
+    Cursor,
+    SubgraphClient,
+    fetch_pool_state_and_decimals_at_block,
+    find_first_event_block,
+    merged_event_stream,
+)
+
+
+# ---------------- Defaults (no secrets) ----------------
+
+DEFAULT_GRAPH_URL = "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3"
 DEFAULT_RPC_URLS = [
     "https://eth.llamarpc.com",
     "https://rpc.ankr.com/eth",
 ]
-JSON_RPC_LINE = (os.environ.get("MEV_RPC_URLS") or os.environ.get("WEB3_PROVIDER_URI") or "").strip()
-if not JSON_RPC_LINE:
-    JSON_RPC_LINE = " ".join(DEFAULT_RPC_URLS)
 
-POOL_ADDR = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"  # USDC/WETH 0.05%
-# POOL_ADDR = "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8"  # USDC/WETH 0.3%
-# POOL_ADDR = "0xe0554a476a092703abdb3ef35c80e0d76d32939f"  # USDC/WETH 0.01%
+DEFAULT_POOL_ADDR = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"  # USDC/WETH 0.05%
+DEFAULT_START_TS: Union[int, str] = "2023-01-01T00:00:00Z"
+DEFAULT_END_TS: Union[int, str] = "2024-12-31T23:59:59Z"
 
-# Provide either UNIX seconds or ISO strings (UTC assumed unless offset specified)
-START_TS: Union[int, str] = "2023-01-01T00:00:00Z"
-END_TS:   Union[int, str] = "2024-12-31T23:59:59Z"
-
-# OPTIMIZED: Adaptive chunks, parallel processing
-CHUNK_SIZE_BLOCKS = 500  # Reduced to avoid provider limits
-PARALLEL_WORKERS = 8      # Parallel chunk processing
-BATCH_RECEIPT_SIZE = 100  # Batch receipt/tx fetching
-
-# Checkpointing / outputs (repo-relative so this script is runnable from any CWD)
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "data"
-CHECKPOINT_PATH = str(DATA_DIR / "checkpoints" / "univ3_checkpoint.json")
-OUT_CSV = str(DATA_DIR / "raw" / f"univ3_{POOL_ADDR}.csv")
-
-# Ensure directories exist early (before any writes).
-Path(CHECKPOINT_PATH).parent.mkdir(parents=True, exist_ok=True)
-Path(OUT_CSV).parent.mkdir(parents=True, exist_ok=True)
-
-# Option to skip gas data entirely (HUGE speedup if True)
-SKIP_GAS_DATA = False  # Set True to skip gasUsed/gasPrice/effectiveGasPrice
-
-# ---------------- Setup ----------------
-w3 = create_multi_provider_web3(JSON_RPC_LINE, request_kwargs={"timeout": 60.0})
-if w3.eth.chain_id != 1:
-    raise RuntimeError(f"Connected chain is not Ethereum mainnet (chain_id={w3.eth.chain_id}).")
-POOL = Web3.to_checksum_address(POOL_ADDR)
+DEFAULT_SUBGRAPH_PAGE_SIZE = 1000
+DEFAULT_FLUSH_EVERY_EVENTS = 10_000
+DEFAULT_RPC_SWAP_CHUNK_BLOCKS = 10
 
 Q96 = 1 << 96
 
-def to_unix(ts: Union[int, str]) -> int:
+
+# ---------------- Small helpers ----------------
+
+def to_unix(ts: Union[int, str, _dt.datetime, pd.Timestamp]) -> int:
+    """
+    Convert a timestamp input to UNIX seconds (UTC).
+
+    Parameters
+    ----------
+    ts:
+        Either an int (already UNIX seconds) or a datetime-like / ISO8601 string.
+
+    Returns
+    -------
+    int
+        UNIX timestamp in seconds.
+
+    Notes
+    -----
+    Uses pandas parsing for ISO8601 strings and timezone normalization.
+
+    Examples
+    --------
+    >>> to_unix(0)
+    0
+    """
     if isinstance(ts, int):
         return ts
+    if isinstance(ts, str):
+        s = ts.strip()
+        if s.lstrip("-").isdigit():
+            return int(s)
+        return int(pd.to_datetime(s, utc=True).value // 10**9)
     return int(pd.to_datetime(ts, utc=True).value // 10**9)
 
-START_TS = to_unix(START_TS)
-END_TS   = to_unix(END_TS)
-if END_TS < START_TS:
-    raise ValueError("END_TS must be >= START_TS")
 
-# ---------------- ABIs ----------------
-SWAP_EVENT_ABI = {
-    "anonymous": False,
-    "inputs": [
-        {"indexed": True,  "internalType":"address","name":"sender","type":"address"},
-        {"indexed": True,  "internalType":"address","name":"recipient","type":"address"},
-        {"indexed": False, "internalType":"int256", "name":"amount0","type":"int256"},
-        {"indexed": False, "internalType":"int256", "name":"amount1","type":"int256"},
-        {"indexed": False, "internalType":"uint160","name":"sqrtPriceX96","type":"uint160"},
-        {"indexed": False, "internalType":"uint128","name":"liquidity","type":"uint128"},
-        {"indexed": False, "internalType":"int24",  "name":"tick","type":"int24"}
-    ],
-    "name": "Swap", "type": "event"
-}
-MINT_EVENT_ABI = {
-    "anonymous": False,
-    "inputs": [
-        {"indexed": False, "internalType":"address","name":"sender","type":"address"},
-        {"indexed": True,  "internalType":"address","name":"owner","type":"address"},
-        {"indexed": True,  "internalType":"int24",  "name":"tickLower","type":"int24"},
-        {"indexed": True,  "internalType":"int24",  "name":"tickUpper","type":"int24"},
-        {"indexed": False, "internalType":"uint128","name":"amount","type":"uint128"},
-        {"indexed": False, "internalType":"uint256","name":"amount0","type":"uint256"},
-        {"indexed": False, "internalType":"uint256","name":"amount1","type":"uint256"}
-    ],
-    "name": "Mint", "type": "event"
-}
-BURN_EVENT_ABI = {
-    "anonymous": False,
-    "inputs": [
-        {"indexed": True,  "internalType":"address","name":"owner","type":"address"},
-        {"indexed": True,  "internalType":"int24",  "name":"tickLower","type":"int24"},
-        {"indexed": True,  "internalType":"int24",  "name":"tickUpper","type":"int24"},
-        {"indexed": False, "internalType":"uint128","name":"amount","type":"uint128"},
-        {"indexed": False, "internalType":"uint256","name":"amount0","type":"uint256"},
-        {"indexed": False, "internalType":"uint256","name":"amount1","type":"uint256"}
-    ],
-    "name": "Burn", "type": "event"
-}
-POOL_STATE_ABI = [
-    {"name":"slot0","inputs":[],"outputs":[
-        {"type":"uint160","name":"sqrtPriceX96"},
-        {"type":"int24","name":"tick"},
-        {"type":"uint16","name":"observationIndex"},
-        {"type":"uint16","name":"observationCardinality"},
-        {"type":"uint16","name":"observationCardinalityNext"},
-        {"type":"uint8","name":"feeProtocol"},
-        {"type":"bool","name":"unlocked"}],
-     "stateMutability":"view","type":"function"},
-    {"name":"liquidity","inputs":[],"outputs":[{"type":"uint128"}],
-     "stateMutability":"view","type":"function"},
-]
-
-contract = w3.eth.contract(address=POOL, abi=[SWAP_EVENT_ABI, MINT_EVENT_ABI, BURN_EVENT_ABI])
-state_c  = w3.eth.contract(address=POOL, abi=POOL_STATE_ABI)
-
-SwapEvent = contract.events.Swap
-MintEvent = contract.events.Mint
-BurnEvent = contract.events.Burn
-
-SWAP_TOPIC0 = w3.keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
-MINT_TOPIC0 = w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
-BURN_TOPIC0 = w3.keccak(text="Burn(address,int24,int24,uint128,uint256,uint256)").hex()
-
-# ---------------- Block helpers with caching ----------------
-_block_cache: Dict[int, Any] = {}
-_ts_cache: Dict[int, int] = {}
-
-def get_block_cached(block_num: int):
-    if block_num not in _block_cache:
-        _block_cache[block_num] = w3.eth.get_block(block_num)
-    return _block_cache[block_num]
-
-def block_ts(bn: int) -> int:
-    if bn not in _ts_cache:
-        _ts_cache[bn] = get_block_cached(bn)["timestamp"]
-    return _ts_cache[bn]
-
-def block_for_timestamp(target_ts: int, mode: str = "start") -> int:
-    latest = w3.eth.block_number
-    lo, hi = 0, latest
-    ans = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        ts = get_block_cached(mid)["timestamp"]
-        if mode == "start":
-            if ts >= target_ts:
-                ans, hi = mid, mid - 1
-            else:
-                lo = mid + 1
-        else:
-            if ts <= target_ts:
-                ans, lo = mid, mid + 1
-            else:
-                hi = mid - 1
-    return ans if ans is not None else (0 if mode == "start" else 0)
-
-START_BLOCK = block_for_timestamp(START_TS, "start")
-END_BLOCK   = block_for_timestamp(END_TS,   "end")
-
-# ---------------- Metadata caches ----------------
-_rcpt_cache: Dict[str, Any] = {}
-# tx hash -> {"from": str|None, "gasPrice": int|None}
-_tx_cache: Dict[str, Dict[str, Optional[Union[str, int]]]] = {}
-
-# ---------------- NEW: focused metadata helpers ----------------
-def batch_fetch_origins(tx_hashes: List[str]) -> Dict[str, Optional[str]]:
+def checksum_or_none(addr: Optional[str]) -> Optional[str]:
     """
-    Fetch only the transaction sender (`from`) for a set of tx hashes.
-    Uses _tx_cache to avoid duplicate RPC calls.
+    Normalize an address string to EIP-55 checksum (or return None).
+
+    Parameters
+    ----------
+    addr:
+        Address string (0x...) or None.
+
+    Returns
+    -------
+    str | None
+        Checksum address if parseable, else None.
+
+    Notes
+    -----
+    Subgraph fields are often lowercase; downstream datasets in this repo use
+    checksum addresses.
+
+    Examples
+    --------
+    >>> checksum_or_none(None) is None
+    True
     """
-    origin_result: Dict[str, Optional[str]] = {}
-
-    to_fetch = [h for h in tx_hashes if h not in _tx_cache or _tx_cache[h].get("from") is None]
-
-    def fetch_tx(txh: str):
-        try:
-            tx = w3.eth.get_transaction(txh)
-            _tx_cache[txh] = {"from": tx["from"], "gasPrice": tx.get("gasPrice")}
-            return txh, _tx_cache[txh]["from"]
-        except Exception:
-            # cache a miss to avoid refetch storms
-            _tx_cache.setdefault(txh, {"from": None, "gasPrice": None})
-            return txh, None
-
-    if to_fetch:
-        with ThreadPoolExecutor(max_workers=min(10, len(to_fetch))) as ex:
-            for fut in as_completed([ex.submit(fetch_tx, h) for h in to_fetch]):
-                txh, origin = fut.result()
-                origin_result[txh] = origin
-
-    # ensure every requested hash has an entry (from cache or fetch)
-    for h in tx_hashes:
-        origin_result.setdefault(h, _tx_cache.get(h, {}).get("from"))
-    return origin_result
-
-
-def batch_fetch_gas(tx_hashes: List[str]) -> Tuple[
-    Dict[str, Optional[int]],  # gasUsed
-    Dict[str, Optional[int]],  # effectiveGasPrice
-    Dict[str, Optional[int]],  # gasPrice (legacy; None on EIP-1559)
-]:
-    """
-    Fetch gas metadata via receipts (gasUsed, effectiveGasPrice),
-    plus legacy gasPrice via tx (using/warming _tx_cache).
-    """
-    gas_used: Dict[str, Optional[int]] = {}
-    eff_price: Dict[str, Optional[int]] = {}
-    gas_price: Dict[str, Optional[int]] = {}
-
-    to_fetch_receipts = [h for h in tx_hashes if h not in _rcpt_cache]
-
-    def fetch_receipt(txh: str):
-        try:
-            rc = w3.eth.get_transaction_receipt(txh)
-            _rcpt_cache[txh] = rc
-            return txh, rc
-        except Exception:
-            return txh, None
-
-    if to_fetch_receipts:
-        with ThreadPoolExecutor(max_workers=min(10, len(to_fetch_receipts))) as ex:
-            for fut in as_completed([ex.submit(fetch_receipt, h) for h in to_fetch_receipts]):
-                txh, rc = fut.result()
-                if rc is not None:
-                    _rcpt_cache[txh] = rc
-
-    # Fill from caches, warming tx cache for gasPrice if needed
-    for h in tx_hashes:
-        rc = _rcpt_cache.get(h)
-        gas_used[h] = int(rc["gasUsed"]) if rc and rc.get("gasUsed") is not None else None
-        eff_price[h] = int(rc["effectiveGasPrice"]) if rc and rc.get("effectiveGasPrice") is not None else None
-
-        if h not in _tx_cache:
-            try:
-                tx = w3.eth.get_transaction(h)
-                _tx_cache[h] = {"from": tx["from"], "gasPrice": tx.get("gasPrice")}
-            except Exception:
-                _tx_cache[h] = {"from": None, "gasPrice": None}
-
-        gprice = _tx_cache[h].get("gasPrice")
-        gas_price[h] = int(gprice) if gprice is not None else None
-
-    return gas_used, eff_price, gas_price
-
-# ---------------- OPTIMIZED: Faster getLogs with better retry ----------------
-RETRYABLE = (
-    "timeout", "503", "502", "500", "429", "rate limit", "too many",
-    "limit exceeded", "gateway", "413", "entity too large", 
-    "payload too large", "request entity too large", "content too big",
-    "range is too large", "max is 1k blocks",
-    "query returned more than 10000 results", "exceeds max results",
-    "-32005", "-32603", "-32602",
-)
-
-def get_logs_chunked_any(topics_any: List[str], start_block: int, end_block: int):
-    """Optimized log fetching with aggressive adaptive chunking"""
-    SOFT_LOG_LIMIT = 5000
-
-    def extract_suggested_range(error_msg: str):
-        import re
-        m = re.search(r'range (\d+)-(\d+)', error_msg)
-        if m:
-            return int(m.group(1)), int(m.group(2))
+    if addr is None:
         return None
-    
-    def yield_range(a: int, b: int, retry_count: int = 0):
-        if retry_count > 2:
-            chunk_size = max((b - a) // 10, 50)
-            for chunk_start in range(a, b + 1, chunk_size):
-                chunk_end = min(chunk_start + chunk_size - 1, b)
-                yield from yield_range(chunk_start, chunk_end, 0)
-            return
-        
-        filt = {
-            "fromBlock": a,
-            "toBlock": b,
-            "address": POOL,
-            "topics": [topics_any],
-        }
-        try:
-            logs = w3.eth.get_logs(filt)
-        except Exception as e:
-            msg = str(e).lower()
-            if b > a:
-                if "exceeds max results" in msg:
-                    suggested = extract_suggested_range(str(e))
-                    if suggested:
-                        s, e2 = suggested
-                        if s == a:
-                            yield from yield_range(a, e2, 0)
-                            if e2 < b:
-                                yield from yield_range(e2 + 1, b, 0)
-                            return
-                    parts = 8
-                    part_size = (b - a) // parts
-                    for i in range(parts):
-                        s = a + i * part_size
-                        e2 = a + (i + 1) * part_size - 1 if i < parts - 1 else b
-                        if s <= e2:
-                            yield from yield_range(s, e2, retry_count + 1)
-                    return
-                elif any(s in msg for s in RETRYABLE):
-                    parts = 8 if ("10000" in msg or "20000" in msg) else (4 if ("entity too large" in msg or "payload too large" in msg) else 2)
-                    part_size = (b - a + 1) // parts
-                    for i in range(parts):
-                        s = a + i * part_size
-                        e2 = a + (i + 1) * part_size - 1 if i < parts - 1 else b
-                        if s <= e2:
-                            yield from yield_range(s, e2, retry_count + 1)
-                    return
-            raise
-        
-        if len(logs) > SOFT_LOG_LIMIT and b > a:
-            mid = (a + b) // 2
-            yield from yield_range(a, mid, retry_count)
-            yield from yield_range(mid + 1, b, retry_count)
-            return
-        
-        for lg in logs:
-            yield lg
-    
-    cur = start_block
-    while cur <= end_block:
-        to_blk = min(cur + CHUNK_SIZE_BLOCKS - 1, end_block)
-        try:
-            yield from yield_range(cur, to_blk)
-        except Exception as e:
-            print(f"  ⚠️  Error in range {cur}-{to_blk}: {str(e)[:100]}")
-            smaller_chunk = max(CHUNK_SIZE_BLOCKS // 4, 10)
-            inner_cur = cur
-            while inner_cur <= to_blk:
-                inner_end = min(inner_cur + smaller_chunk - 1, to_blk)
-                yield from yield_range(inner_cur, inner_end)
-                inner_cur = inner_end + 1
-        cur = to_blk + 1
-
-# ---------------- Checkpoint helpers ----------------
-def load_checkpoint(path: str) -> Optional[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        return json.load(f)
-
-def atomic_write_json(path: str, payload: Dict[str, Any]):
-    d = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(prefix=".ckpt_", dir=d, text=True)
+    a = str(addr)
+    if not a.startswith("0x") or len(a) != 42:
+        return a
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
-        os.replace(tmp, path)
+        return Web3.to_checksum_address(a)
     except Exception:
-        try: os.remove(tmp)
-        except Exception: pass
-        raise
+        return a
 
-def save_checkpoint(path: str, data: Dict[str, Any]): 
-    atomic_write_json(path, data)
 
-def csv_append(df: pd.DataFrame, path: str):
-    header = not os.path.exists(path)
-    df.to_csv(path, mode="a", header=header, index=False)
+def virt_x(L: int, sqrtP_x96: int) -> Optional[int]:
+    """
+    Compute virtual reserve x = L / sqrt(P) in Q64.96 convention.
 
-# ---------------- Virtual balances ----------------
-def virt_x(L, sP): return (int(L) * Q96) // int(sP) if sP else None
-def virt_y(L, sP): return (int(L) * int(sP)) // Q96 if sP else None
+    Parameters
+    ----------
+    L:
+        Active liquidity (uint128 as int).
+    sqrtP_x96:
+        sqrtPriceX96 (Q64.96) as int.
 
-# ---------------- OPTIMIZED: Parallel log processing ----------------
-def process_logs_parallel(logs_chunks: List[List], start_block: int, end_block: int):
-    """Process multiple log chunks in parallel"""
-    all_rows = []
-    def process_chunk(logs):
-        rows = []
-        for log in logs:
-            topic0 = log["topics"][0].hex()
-            bn = log["blockNumber"]
-            ts = block_ts(bn)
-            if ts < START_TS or ts > END_TS:
-                continue
-            txh = log["transactionHash"].hex()
-            if topic0 == SWAP_TOPIC0:
-                evt = get_event_data(w3.codec, SwapEvent._get_event_abi(), log)
-                a = evt["args"]
-                rows.append({
-                    "eventType": "Swap",
-                    "blockNumber": bn, "logIndex": log["logIndex"], "timestamp": ts,
-                    "transactionHash": txh,
-                    "gasUsed": None, "gasPrice": None, "effectiveGasPrice": None, "origin": None,
-                    "sender": a["sender"], "owner": None, "recipient": a["recipient"],
-                    "amount0": int(a["amount0"]), "amount1": int(a["amount1"]),
-                    "sqrtPriceX96_event": int(a["sqrtPriceX96"]),
-                    "tick_event": int(a["tick"]),
-                    "liquidityAfter_event": int(a["liquidity"]),
-                    "tickLower": None, "tickUpper": None,
-                    "liquidityDelta": None
-                })
-            elif topic0 == MINT_TOPIC0:
-                evt = get_event_data(w3.codec, MintEvent._get_event_abi(), log)
-                a = evt["args"]
-                rows.append({
-                    "eventType": "Mint",
-                    "blockNumber": bn, "logIndex": log["logIndex"], "timestamp": ts,
-                    "transactionHash": txh,
-                    "gasUsed": None, "gasPrice": None, "effectiveGasPrice": None, "origin": None,
-                    "sender": a["sender"], "owner": a["owner"], "recipient": None,
-                    "amount0": int(a["amount0"]), "amount1": int(a["amount1"]),
-                    "sqrtPriceX96_event": None, "tick_event": None, "liquidityAfter_event": None,
-                    "tickLower": int(a["tickLower"]), "tickUpper": int(a["tickUpper"]),
-                    "liquidityDelta": int(a["amount"])
-                })
-            elif topic0 == BURN_TOPIC0:
-                evt = get_event_data(w3.codec, BurnEvent._get_event_abi(), log)
-                a = evt["args"]
-                rows.append({
-                    "eventType": "Burn",
-                    "blockNumber": bn, "logIndex": log["logIndex"], "timestamp": ts,
-                    "transactionHash": txh,
-                    "gasUsed": None, "gasPrice": None, "effectiveGasPrice": None, "origin": None,
-                    "sender": None, "owner": a["owner"], "recipient": None,
-                    "amount0": int(a["amount0"]), "amount1": int(a["amount1"]),
-                    "sqrtPriceX96_event": None, "tick_event": None, "liquidityAfter_event": None,
-                    "tickLower": int(a["tickLower"]), "tickUpper": int(a["tickUpper"]),
-                    "liquidityDelta": -int(a["amount"])
-                })
-        return rows
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        futures = [executor.submit(process_chunk, chunk) for chunk in logs_chunks]
-        for future in as_completed(futures):
-            all_rows.extend(future.result())
-    return all_rows
+    Returns
+    -------
+    int | None
+        Virtual x reserve in token0 raw units (approx), or None if sqrt is zero.
 
-# ---------------- OPTIMIZED: Main processing function ----------------
-def process_window(from_block: int, to_block: int, 
-                   cur_L: int, cur_sqrt: int, cur_tick: int) -> Dict[str, Any]:
-    """Optimized window processing with parallel operations"""
-    print(f"  Fetching logs for blocks {from_block}-{to_block}.")
-    all_logs = list(get_logs_chunked_any([SWAP_TOPIC0, MINT_TOPIC0, BURN_TOPIC0], 
-                                          from_block, to_block))
-    if not all_logs:
-        return {
-            "df_chunk": pd.DataFrame(),
-            "new_cur_L": cur_L, "new_cur_sqrt": cur_sqrt, "new_cur_tick": cur_tick,
-            "first_event_block": None, "last_event_block": None, "n_rows": 0
-        }
-    print(f"  Processing {len(all_logs)} logs.")
-    chunk_size = max(len(all_logs) // PARALLEL_WORKERS, 100)
-    log_chunks = [all_logs[i:i+chunk_size] for i in range(0, len(all_logs), chunk_size)]
-    rows = process_logs_parallel(log_chunks, from_block, to_block)
-    if not rows:
-        return {
-            "df_chunk": pd.DataFrame(),
-            "new_cur_L": cur_L, "new_cur_sqrt": cur_sqrt, "new_cur_tick": cur_tick,
-            "first_event_block": None, "last_event_block": None, "n_rows": 0
-        }
-    df = pd.DataFrame(rows).sort_values(["blockNumber","logIndex"]).reset_index(drop=True)
+    Notes
+    -----
+    This is a v2-like virtual reserve mapping used throughout the repo.
 
-    # ---- NEW: fetch origins always (cheap), gas optionally
-    tx_list = df["transactionHash"].unique().tolist()
+    Examples
+    --------
+    >>> virt_x(1, 1 << 96)  # sqrtP=1.0 in Q96
+    1
+    """
+    if not sqrtP_x96:
+        return None
+    return (int(L) * Q96) // int(sqrtP_x96)
 
-    # Origins
-    print(f"  Fetching origins for {len(tx_list)} transactions...")
-    origin_map: Dict[str, Optional[str]] = {}
-    for i in range(0, len(tx_list), BATCH_RECEIPT_SIZE):
-        batch = tx_list[i:i+BATCH_RECEIPT_SIZE]
-        origins = batch_fetch_origins(batch)
-        origin_map.update(origins)
-    df["origin"] = df["transactionHash"].map(origin_map)
 
-    # Gas fields
-    if not SKIP_GAS_DATA:
-        print(f"  Fetching gas fields for {len(tx_list)} transactions...")
-        gas_used_map: Dict[str, Optional[int]] = {}
-        eff_price_map: Dict[str, Optional[int]] = {}
-        gas_price_map: Dict[str, Optional[int]] = {}
+def virt_y(L: int, sqrtP_x96: int) -> Optional[int]:
+    """
+    Compute virtual reserve y = L * sqrt(P) in Q64.96 convention.
 
-        for i in range(0, len(tx_list), BATCH_RECEIPT_SIZE):
-            batch = tx_list[i:i+BATCH_RECEIPT_SIZE]
-            gused, geff, gprice = batch_fetch_gas(batch)
-            gas_used_map.update(gused)
-            eff_price_map.update(geff)
-            gas_price_map.update(gprice)
+    Parameters
+    ----------
+    L:
+        Active liquidity (uint128 as int).
+    sqrtP_x96:
+        sqrtPriceX96 (Q64.96) as int.
 
-        df["gasUsed"]           = df["transactionHash"].map(gas_used_map)
-        df["effectiveGasPrice"] = df["transactionHash"].map(eff_price_map)
-        df["gasPrice"]          = df["transactionHash"].map(gas_price_map)
-    else:
-        # Ensure gas columns exist with None (schema stability)
-        if "gasUsed" not in df.columns: df["gasUsed"] = None
-        if "gasPrice" not in df.columns: df["gasPrice"] = None
-        if "effectiveGasPrice" not in df.columns: df["effectiveGasPrice"] = None
+    Returns
+    -------
+    int | None
+        Virtual y reserve in token1 raw units (approx), or None if sqrt is zero.
 
-    # ---- Running state calculation
-    print(f"  Computing running state.")
-    pre_L, pre_sqrt, pre_tick = [], [], []
-    post_L, post_sqrt, post_tick = [], [], []
-    x_before, y_before, x_after, y_after = [], [], [], []
-    affects_active, delta_applied = [], []
-    
+    Notes
+    -----
+    This is a v2-like virtual reserve mapping used throughout the repo.
+
+    Examples
+    --------
+    >>> virt_y(1, 1 << 96)  # sqrtP=1.0 in Q96
+    1
+    """
+    if not sqrtP_x96:
+        return None
+    return (int(L) * int(sqrtP_x96)) // Q96
+
+
+def ensure_schema_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure output schema columns exist (stability for downstream scripts).
+
+    Parameters
+    ----------
+    df:
+        DataFrame containing event rows.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same DataFrame, with missing columns added (filled with None).
+
+    Notes
+    -----
+    This keeps the dataset compatible with existing CSV readers and scripts.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> out = ensure_schema_columns(pd.DataFrame([{\"eventType\":\"Swap\",\"blockNumber\":1,\"logIndex\":0,\"timestamp\":0,\"transactionHash\":\"0x\"}]))
+    >>> \"L_before\" in out.columns
+    True
+    """
+    cols = [
+        "eventType",
+        "blockNumber",
+        "logIndex",
+        "timestamp",
+        "transactionHash",
+        "gasUsed",
+        "gasPrice",
+        "effectiveGasPrice",
+        "origin",
+        "sender",
+        "owner",
+        "recipient",
+        "amount0",
+        "amount1",
+        "sqrtPriceX96_event",
+        "tick_event",
+        "liquidityAfter_event",
+        "tickLower",
+        "tickUpper",
+        "liquidityDelta",
+        "L_before",
+        "sqrt_before",
+        "tick_before",
+        "x_before",
+        "y_before",
+        "L_after",
+        "sqrt_after",
+        "tick_after",
+        "x_after",
+        "y_after",
+        "affectsActive",
+        "deltaL_applied",
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]
+
+
+def compute_running_state(
+    df: pd.DataFrame, cur_L: int, cur_sqrt: int, cur_tick: int
+) -> Tuple[pd.DataFrame, int, int, int]:
+    """
+    Compute running state columns (before/after) for an ordered event DataFrame.
+
+    Parameters
+    ----------
+    df:
+        DataFrame sorted by (blockNumber, logIndex), containing event rows.
+    cur_L, cur_sqrt, cur_tick:
+        Initial pool state at the block immediately before the first row.
+
+    Returns
+    -------
+    (df, new_L, new_sqrt, new_tick):
+        DataFrame with derived columns filled, and the final pool state after
+        processing all rows.
+
+    Notes
+    -----
+    - For Mint/Burn, active liquidity changes only if the current tick is inside
+      [tickLower, tickUpper).
+    - For Swap, active liquidity is set from Swap.liquidityAfter_event, and
+      sqrt/tick are set from the swap event.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> df = pd.DataFrame([{\"eventType\":\"Mint\",\"blockNumber\":1,\"logIndex\":0,\"tickLower\":0,\"tickUpper\":10,\"liquidityDelta\":5}]).sort_values([\"blockNumber\",\"logIndex\"])
+    >>> df2, L2, sp2, tk2 = compute_running_state(df, cur_L=1, cur_sqrt=1<<96, cur_tick=5)
+    >>> int(df2.iloc[0][\"L_after\"]) == 6
+    True
+    """
+    pre_L: List[int] = []
+    pre_sqrt: List[int] = []
+    pre_tick: List[int] = []
+    post_L: List[int] = []
+    post_sqrt: List[int] = []
+    post_tick: List[int] = []
+    x_before: List[Optional[int]] = []
+    y_before: List[Optional[int]] = []
+    x_after: List[Optional[int]] = []
+    y_after: List[Optional[int]] = []
+    affects_active: List[Optional[bool]] = []
+    delta_applied: List[Optional[int]] = []
+
     curL, curSP, curTk = int(cur_L), int(cur_sqrt), int(cur_tick)
-    
+
     for _, row in df.iterrows():
         etype = row["eventType"]
-        pre_L.append(curL); pre_sqrt.append(curSP); pre_tick.append(curTk)
+
+        pre_L.append(curL)
+        pre_sqrt.append(curSP)
+        pre_tick.append(curTk)
         x_before.append(virt_x(curL, curSP))
         y_before.append(virt_y(curL, curSP))
+
         if etype in ("Mint", "Burn"):
-            hit = (row["tickLower"] <= curTk) and (curTk < row["tickUpper"])
-            affects_active.append(bool(hit))
+            hit = bool(int(row["tickLower"]) <= curTk < int(row["tickUpper"]))
+            affects_active.append(hit)
             dL = int(row["liquidityDelta"]) if hit else 0
-            delta_applied.append(dL)
+            delta_applied.append(int(dL))
             curL = curL + dL
-            post_L.append(curL); post_sqrt.append(curSP); post_tick.append(curTk)
-        elif etype == "Swap":
+            post_L.append(curL)
+            post_sqrt.append(curSP)
+            post_tick.append(curTk)
+        else:  # Swap
             affects_active.append(None)
             delta_applied.append(None)
-            curL = int(row["liquidityAfter_event"])
+
+            liq_after = row.get("liquidityAfter_event")
+            if liq_after is None or (isinstance(liq_after, float) and pd.isna(liq_after)):
+                raise ValueError("Missing liquidityAfter_event for Swap row; cannot compute running state.")
+
+            curL = int(liq_after)
             curSP = int(row["sqrtPriceX96_event"])
             curTk = int(row["tick_event"])
-            post_L.append(curL); post_sqrt.append(curSP); post_tick.append(curTk)
+
+            post_L.append(curL)
+            post_sqrt.append(curSP)
+            post_tick.append(curTk)
+
         x_after.append(virt_x(post_L[-1], post_sqrt[-1]))
         y_after.append(virt_y(post_L[-1], post_sqrt[-1]))
-    
+
     df["L_before"] = pre_L
     df["sqrt_before"] = pre_sqrt
     df["tick_before"] = pre_tick
@@ -628,131 +375,713 @@ def process_window(from_block: int, to_block: int,
     df["y_after"] = y_after
     df["affectsActive"] = affects_active
     df["deltaL_applied"] = delta_applied
-    
-    return {
-        "df_chunk": df,
-        "new_cur_L": curL, "new_cur_sqrt": curSP, "new_cur_tick": curTk,
-        "first_event_block": int(df.iloc[0]["blockNumber"]),
-        "last_event_block": int(df.iloc[-1]["blockNumber"]),
-        "n_rows": len(df),
-    }
 
-# ---------------- Main execution ----------------
-print(f"Starting data fetch for pool {POOL_ADDR}")
-print(f"Date range: {pd.to_datetime(START_TS, unit='s')} to {pd.to_datetime(END_TS, unit='s')}")
-print(f"Block range: {START_BLOCK} to {END_BLOCK} (~{END_BLOCK - START_BLOCK:,} blocks)")
-print(f"Settings: CHUNK_SIZE={CHUNK_SIZE_BLOCKS}, WORKERS={PARALLEL_WORKERS}, SKIP_GAS={SKIP_GAS_DATA}")
+    return df, int(curL), int(curSP), int(curTk)
 
-ckpt = load_checkpoint(CHECKPOINT_PATH)
-fresh = True
 
-if ckpt:
-    ok = (
-        ckpt.get("pool") == POOL_ADDR
-        and ckpt.get("start_ts") == START_TS
-        and ckpt.get("end_ts") == END_TS
-        and ckpt.get("start_block") == START_BLOCK
-        and ckpt.get("end_block") == END_BLOCK
+def csv_append(df: pd.DataFrame, path: str) -> None:
+    """
+    Append a DataFrame to a CSV file (writes header only once).
+
+    Parameters
+    ----------
+    df:
+        DataFrame to append.
+    path:
+        Target CSV path.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The header is written only if the target file does not exist.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> csv_append(pd.DataFrame([{\"a\":1}]), \"/tmp/example_append.csv\")
+    """
+    header = not os.path.exists(path)
+    df.to_csv(path, mode="a", header=header, index=False)
+
+
+def _tail_last_csv_row(path: str) -> Optional[Dict[str, str]]:
+    """
+    Read the last non-empty row of a CSV (no pandas, O(1) seek).
+
+    Parameters
+    ----------
+    path:
+        CSV file path.
+
+    Returns
+    -------
+    dict | None
+        Mapping column->string value for the last row, or None if file has no data rows.
+
+    Notes
+    -----
+    Assumes fields are simple (no embedded newlines/commas). This holds for the
+    datasets produced by this repo.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+
+    with open(path, "rb") as fh:
+        header = fh.readline().decode("utf-8").rstrip("\n")
+        cols = header.split(",")
+        # seek from end to find last newline
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        if end <= len(header) + 1:
+            return None
+        # read last up to 64k bytes
+        read_size = min(65_536, end)
+        fh.seek(end - read_size)
+        chunk = fh.read(read_size)
+        lines = chunk.splitlines()
+        if not lines:
+            return None
+        # last line might be empty if file ends with newline
+        last = lines[-1].decode("utf-8").strip()
+        if not last and len(lines) >= 2:
+            last = lines[-2].decode("utf-8").strip()
+        if not last:
+            return None
+        values = last.split(",")
+        if len(values) != len(cols):
+            return None
+        return dict(zip(cols, values))
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """
+    Parse CLI arguments.
+
+    Parameters
+    ----------
+    argv:
+        Optional argv list (defaults to sys.argv).
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments.
+
+    Notes
+    -----
+    Defaults are chosen to make `python scripts/data_fetch.py` runnable without
+    extra flags (endpoints can be set via env vars).
+
+    Examples
+    --------
+    >>> ns = parse_args([\"--pool\", \"0x0000000000000000000000000000000000000000\"])
+    >>> hasattr(ns, \"pool\")
+    True
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    data_dir = repo_root / "data"
+
+    p = argparse.ArgumentParser(description="Subgraph-first Uniswap v3 pool harvester (CSV + checkpoint)")
+    p.add_argument("--pool", default=DEFAULT_POOL_ADDR, help="Pool address (0x...)")
+    p.add_argument("--start-ts", default=DEFAULT_START_TS, help="Start timestamp (unix seconds or ISO8601)")
+    p.add_argument("--end-ts", default=DEFAULT_END_TS, help="End timestamp (unix seconds or ISO8601)")
+
+    p.add_argument(
+        "--graph-url",
+        default=os.environ.get("UNIV3_GRAPH_URL", "").strip() or DEFAULT_GRAPH_URL,
+        help="Subgraph GraphQL endpoint (env: UNIV3_GRAPH_URL)",
     )
-    if ok:
-        from_block = int(ckpt["next_from_block"])
+    p.add_argument(
+        "--rpc-urls",
+        default=(os.environ.get("MEV_RPC_URLS") or os.environ.get("WEB3_PROVIDER_URI") or "").strip()
+        or " ".join(DEFAULT_RPC_URLS),
+        help="Space-separated RPC URLs (env: MEV_RPC_URLS or WEB3_PROVIDER_URI)",
+    )
+
+    p.add_argument(
+        "--out-csv",
+        default=str(data_dir / "raw" / f"univ3_{DEFAULT_POOL_ADDR}.csv"),
+        help="Output CSV path",
+    )
+    p.add_argument(
+        "--checkpoint",
+        default=str(data_dir / "checkpoints" / "univ3_checkpoint.json"),
+        help="Checkpoint JSON path",
+    )
+
+    p.add_argument("--subgraph-page-size", type=int, default=DEFAULT_SUBGRAPH_PAGE_SIZE)
+    p.add_argument("--flush-every-events", type=int, default=DEFAULT_FLUSH_EVERY_EVENTS)
+    p.add_argument("--rpc-swap-log-chunk-blocks", type=int, default=DEFAULT_RPC_SWAP_CHUNK_BLOCKS)
+    p.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=15.0,
+        help="Print a progress heartbeat while streaming events (0 disables).",
+    )
+    p.add_argument(
+        "--max-events",
+        type=int,
+        default=0,
+        help="If >0, stop after writing this many events (debug/smoke runs).",
+    )
+    p.add_argument(
+        "--strict-amount-conversion",
+        action="store_true",
+        default=True,
+        help="Require exact BigDecimal->raw conversion using token decimals (recommended).",
+    )
+    p.add_argument(
+        "--no-strict-amount-conversion",
+        action="store_false",
+        dest="strict_amount_conversion",
+        help="Truncate BigDecimal->raw conversion toward zero if not integral (not recommended).",
+    )
+
+    args = p.parse_args(argv)
+    # Make output paths pool-dependent unless user explicitly set them.
+    pool_checksum = Web3.to_checksum_address(args.pool)
+    pool_lower = pool_checksum.lower()
+    if args.out_csv.endswith(f"univ3_{DEFAULT_POOL_ADDR}.csv"):
+        args.out_csv = str(data_dir / "raw" / f"univ3_{pool_lower}.csv")
+    return args
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """
+    Main entry point.
+
+    Parameters
+    ----------
+    argv:
+        Optional argv list (defaults to sys.argv).
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Intended usage is via environment variables:
+      - UNIV3_GRAPH_URL
+      - MEV_RPC_URLS
+
+    Examples
+    --------
+    >>> isinstance(main, object)
+    True
+    """
+    args = parse_args(argv)
+
+    pool_checksum = Web3.to_checksum_address(args.pool)
+    pool_lower = pool_checksum.lower()
+    start_ts = to_unix(args.start_ts)
+    end_ts = to_unix(args.end_ts)
+    if end_ts < start_ts:
+        raise ValueError("end-ts must be >= start-ts")
+
+    out_csv = str(Path(args.out_csv))
+    ckpt_path = str(Path(args.checkpoint))
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Print config first so the user sees something immediately.
+    print(f"Pool: {pool_checksum}", flush=True)
+    print(f"Window: {pd.to_datetime(start_ts, unit='s', utc=True)} -> {pd.to_datetime(end_ts, unit='s', utc=True)}", flush=True)
+    print(f"Graph: {args.graph_url}", flush=True)
+    print(f"RPC URLs: {len(args.rpc_urls.split())} endpoint(s)", flush=True)
+    print(f"Output: {out_csv}", flush=True)
+    print(f"Checkpoint: {ckpt_path}", flush=True)
+    print(f"Settings: page={args.subgraph_page_size}, flush={args.flush_every_events}, rpc_chunk_blocks={args.rpc_swap_log_chunk_blocks}", flush=True)
+
+    # Subgraph + RPC setup
+    sg = SubgraphClient(args.graph_url)
+    print("Connecting to RPC…", flush=True)
+    w3 = create_multi_provider_web3(args.rpc_urls, request_kwargs={"timeout": 60.0})
+    if w3.eth.chain_id != 1:
+        raise RuntimeError(f"Connected chain is not Ethereum mainnet (chain_id={w3.eth.chain_id}).")
+    print("RPC connected (mainnet).", flush=True)
+
+    # Quarantine-aware direct JSON-RPC caller used for eth_getLogs (swap liquidity).
+    # This avoids repeatedly hitting an endpoint that returns HTTP 429/Retry-After.
+    rpc = QuarantinedRPC(args.rpc_urls.split())
+
+    ckpt = load_checkpoint(ckpt_path)
+
+    # Resume-safe cursors and running state.
+    cur_swap = Cursor()
+    cur_mint = Cursor()
+    cur_burn = Cursor()
+    cur_L: Optional[int] = None
+    cur_sqrt: Optional[int] = None
+    cur_tick: Optional[int] = None
+    token0_decimals: Optional[int] = None
+    token1_decimals: Optional[int] = None
+    events_written = 0
+    last_written_key: Optional[Tuple[int, int]] = None
+
+    def ckpt_matches(c: Dict[str, Any]) -> bool:
+        return (
+            c.get("ckpt_version") == 2
+            and str(c.get("pool", "")).lower() == pool_lower
+            and int(c.get("start_ts", -1)) == int(start_ts)
+            and int(c.get("end_ts", -1)) == int(end_ts)
+            and str(c.get("graph_url", "")).strip() == str(args.graph_url).strip()
+        )
+
+    resuming = bool(ckpt and ckpt_matches(ckpt))
+
+    if resuming:
+        print("Resuming from checkpoint.", flush=True)
+        cur_swap.last_id = str(ckpt.get("cursor", {}).get("swap_last_id", "") or "")
+        cur_mint.last_id = str(ckpt.get("cursor", {}).get("mint_last_id", "") or "")
+        cur_burn.last_id = str(ckpt.get("cursor", {}).get("burn_last_id", "") or "")
         cur_L = int(ckpt["cur_L"])
         cur_sqrt = int(ckpt["cur_sqrt"])
         cur_tick = int(ckpt["cur_tick"])
-        fresh = False
-        print(f"Resuming from block {from_block} (state: L={cur_L}, sP={cur_sqrt}, tick={cur_tick})")
+        token0_decimals = ckpt.get("token0_decimals")
+        token1_decimals = ckpt.get("token1_decimals")
+        events_written = int(ckpt.get("events_written", 0))
+        if ckpt.get("last_written", None):
+            lw = ckpt["last_written"]
+            try:
+                last_written_key = (int(lw["blockNumber"]), int(lw["logIndex"]))
+            except Exception:
+                last_written_key = None
     else:
-        print("Checkpoint params differ. Starting fresh.")
-        ckpt = None
+        print("No matching checkpoint found; starting fresh.", flush=True)
+        # Avoid accidentally appending to an old output file from a different run.
+        if os.path.exists(out_csv) and os.path.getsize(out_csv) > 0:
+            ts = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            bak = out_csv + f".bak_{ts}"
+            os.replace(out_csv, bak)
+            print(f"  ⚠️  Existing output moved aside: {bak}", flush=True)
+        # Same for a mismatching checkpoint (keep it for debugging).
+        if ckpt and os.path.exists(ckpt_path) and os.path.getsize(ckpt_path) > 0:
+            ts = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            bak = ckpt_path + f".bak_{ts}"
+            os.replace(ckpt_path, bak)
+            print(f"  ⚠️  Existing checkpoint moved aside: {bak}", flush=True)
 
-if fresh:
-    from_block = START_BLOCK
-    prev_block = max(from_block - 1, 0)
-    s0 = state_c.functions.slot0().call(block_identifier=prev_block)
-    L0 = int(state_c.functions.liquidity().call(block_identifier=prev_block))
-    cur_sqrt = int(s0[0]); cur_tick = int(s0[1]); cur_L = int(L0)
-    
-    if os.path.exists(OUT_CSV):
-        print(f"Removing previous output {OUT_CSV}")
-        os.remove(OUT_CSV)
-    
-    ckpt = {
-        "pool": POOL_ADDR,
-        "start_ts": START_TS,
-        "end_ts": END_TS,
-        "start_block": START_BLOCK,
-        "end_block": END_BLOCK,
-        "next_from_block": from_block,
-        "cur_L": cur_L,
-        "cur_sqrt": cur_sqrt,
-        "cur_tick": cur_tick,
-        "events_written": 0,
-        "last_event_block": None,
-        "out_csv": OUT_CSV,
-    }
-    save_checkpoint(CHECKPOINT_PATH, ckpt)
-    print(f"Initial state at block {prev_block}: L={cur_L}, sP={cur_sqrt}, tick={cur_tick}")
+    # If resuming, prefer the last row of the CSV as the source of truth for the
+    # last-written key and state. This protects against crashes between CSV append
+    # and checkpoint save.
+    if resuming:
+        if not os.path.exists(out_csv):
+            if events_written == 0:
+                # Checkpoint was saved before any rows were written (e.g., crash
+                # during first flush).  Safe to treat as a fresh start.
+                print("Checkpoint has 0 events and CSV is missing; restarting fresh.", flush=True)
+                resuming = False
+            else:
+                raise RuntimeError("Checkpoint exists but output CSV is missing; cannot resume safely.")
 
-# Progress tracking
-import datetime
-start_time = time.time()
-initial_block = from_block
-total_blocks = END_BLOCK - START_BLOCK + 1
+        last_row = _tail_last_csv_row(out_csv)
+        if last_row:
+            try:
+                file_key = (int(last_row["blockNumber"]), int(last_row["logIndex"]))
+                file_L = int(last_row["L_after"])
+                file_sqrt = int(last_row["sqrt_after"])
+                file_tick = int(last_row["tick_after"])
+                if last_written_key is None or file_key > last_written_key:
+                    last_written_key = file_key
+                    cur_L, cur_sqrt, cur_tick = file_L, file_sqrt, file_tick
+                print(f"Last CSV row key: block={file_key[0]}, logIndex={file_key[1]} (state recovered from file).", flush=True)
+            except Exception:
+                pass
 
-while from_block <= END_BLOCK:
-    to_block = min(from_block + CHUNK_SIZE_BLOCKS - 1, END_BLOCK)
-    
-    blocks_done = from_block - initial_block
-    pct_done = (blocks_done / total_blocks) * 100 if total_blocks > 0 else 0
-    elapsed = time.time() - start_time
-    if blocks_done > 0:
-        rate = blocks_done / elapsed
-        eta = (total_blocks - blocks_done) / rate if rate > 0 else 0
-        eta_str = str(datetime.timedelta(seconds=int(eta)))
-        print(f"\n[{pct_done:.1f}%] Processing blocks [{from_block:,}, {to_block:,}] "
-              f"(Rate: {rate:.0f} blocks/s, ETA: {eta_str})")
-    else:
-        print(f"\nProcessing blocks [{from_block:,}, {to_block:,}].")
-    
-    result = process_window(from_block, to_block, cur_L, cur_sqrt, cur_tick)
-    df_chunk = result["df_chunk"]
-    n_rows = result["n_rows"]
-    
-    cur_L = result["new_cur_L"]
-    cur_sqrt = result["new_cur_sqrt"]
-    cur_tick = result["new_cur_tick"]
-    
-    if n_rows > 0:
-        csv_append(df_chunk, OUT_CSV)
-        ckpt.update({
-            "cur_L": cur_L,
-            "cur_sqrt": cur_sqrt,
-            "cur_tick": cur_tick,
-            "events_written": int(ckpt.get("events_written", 0)) + n_rows,
-            "last_event_block": result["last_event_block"],
-            "next_from_block": to_block + 1,
-        })
-        save_checkpoint(CHECKPOINT_PATH, ckpt)
-        print(f"  ✓ Wrote {n_rows} rows | Last event block: {result['last_event_block']}")
-    else:
-        ckpt.update({
-            "cur_L": cur_L,
-            "cur_sqrt": cur_sqrt,
-            "cur_tick": cur_tick,
-            "next_from_block": to_block + 1,
-        })
-        save_checkpoint(CHECKPOINT_PATH, ckpt)
-        print("  ✓ No events in window")
-    
-    from_block = to_block + 1
+    if token0_decimals is None or token1_decimals is None or cur_L is None or cur_sqrt is None or cur_tick is None:
+        # Initialize state/decimals from subgraph (fallback to RPC if needed).
+        first_block = find_first_event_block(sg, pool_lower, start_ts)
+        if first_block is None:
+            print("No events found in the requested window; nothing to do.", flush=True)
+            return
+        prev_block = max(int(first_block) - 1, 0)
+        print(f"Initializing state at block {prev_block} (first event block is {first_block}).", flush=True)
 
-# Final summary
-elapsed_total = time.time() - start_time
-print(f"\n{'='*60}")
-print(f"✅ COMPLETED!")
-print(f"Time range: {pd.to_datetime(START_TS, unit='s')} to {pd.to_datetime(END_TS, unit='s')}")
-print(f"Total events written: {ckpt.get('events_written', 0):,}")
-print(f"Output file: {OUT_CSV}")
-print(f"Total time: {str(datetime.timedelta(seconds=int(elapsed_total)))}")
-print(f"Average rate: {total_blocks/elapsed_total:.0f} blocks/second")
-print(f"{'='*60}")
+        try:
+            st = fetch_pool_state_and_decimals_at_block(sg, pool_lower, prev_block)
+            cur_L, cur_sqrt, cur_tick = st.liquidity, st.sqrt_price_x96, st.tick
+            token0_decimals, token1_decimals = st.token0_decimals, st.token1_decimals
+        except Exception as exc:
+            print(f"⚠️  Subgraph pool-at-block query failed ({exc}); falling back to RPC calls.", flush=True)
+            # RPC fallback: slot0/liquidity at prev_block
+            POOL_STATE_ABI = [
+                {
+                    "name": "slot0",
+                    "inputs": [],
+                    "outputs": [
+                        {"type": "uint160", "name": "sqrtPriceX96"},
+                        {"type": "int24", "name": "tick"},
+                        {"type": "uint16", "name": "observationIndex"},
+                        {"type": "uint16", "name": "observationCardinality"},
+                        {"type": "uint16", "name": "observationCardinalityNext"},
+                        {"type": "uint8", "name": "feeProtocol"},
+                        {"type": "bool", "name": "unlocked"},
+                    ],
+                    "stateMutability": "view",
+                    "type": "function",
+                },
+                {
+                    "name": "liquidity",
+                    "inputs": [],
+                    "outputs": [{"type": "uint128"}],
+                    "stateMutability": "view",
+                    "type": "function",
+                },
+            ]
+            state_c = w3.eth.contract(address=pool_checksum, abi=POOL_STATE_ABI)
+            s0 = state_c.functions.slot0().call(block_identifier=prev_block)
+            L0 = state_c.functions.liquidity().call(block_identifier=prev_block)
+            cur_sqrt, cur_tick, cur_L = int(s0[0]), int(s0[1]), int(L0)
+
+            # decimals fallback: token0/token1 decimals
+            POOL_INFO_ABI = [
+                {
+                    "inputs": [],
+                    "name": "token0",
+                    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+                    "stateMutability": "view",
+                    "type": "function",
+                },
+                {
+                    "inputs": [],
+                    "name": "token1",
+                    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+                    "stateMutability": "view",
+                    "type": "function",
+                },
+            ]
+            ERC20_DECIMALS_ABI = [
+                {
+                    "inputs": [],
+                    "name": "decimals",
+                    "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+                    "stateMutability": "view",
+                    "type": "function",
+                }
+            ]
+            pool_contract = w3.eth.contract(address=pool_checksum, abi=POOL_INFO_ABI)
+            t0 = pool_contract.functions.token0().call()
+            t1 = pool_contract.functions.token1().call()
+            token0_decimals = int(w3.eth.contract(address=t0, abi=ERC20_DECIMALS_ABI).functions.decimals().call())
+            token1_decimals = int(w3.eth.contract(address=t1, abi=ERC20_DECIMALS_ABI).functions.decimals().call())
+
+        # Start fresh: write a new checkpoint header (does not overwrite CSV).
+        ckpt = {
+            "ckpt_version": 2,
+            "pool": pool_lower,
+            "start_ts": int(start_ts),
+            "end_ts": int(end_ts),
+            "graph_url": str(args.graph_url).strip(),
+            "out_csv": out_csv,
+            "token0_decimals": int(token0_decimals) if token0_decimals is not None else None,
+            "token1_decimals": int(token1_decimals) if token1_decimals is not None else None,
+            "cur_L": int(cur_L),
+            "cur_sqrt": int(cur_sqrt),
+            "cur_tick": int(cur_tick),
+            "cursor": {"swap_last_id": "", "mint_last_id": "", "burn_last_id": ""},
+            "events_written": int(events_written),
+            "last_written": None,
+            "updated_at": int(time.time()),
+        }
+        save_checkpoint_atomic(ckpt_path, ckpt)
+
+    assert cur_L is not None and cur_sqrt is not None and cur_tick is not None
+    assert token0_decimals is not None and token1_decimals is not None
+
+    # Stream and flush
+    buf: List[Dict[str, Any]] = []
+    t0 = time.time()
+    last_print = t0
+    last_heartbeat = t0
+    heartbeat_s = float(args.heartbeat_seconds or 0.0)
+    streamed_total = 0
+
+    stream = merged_event_stream(
+        sg,
+        pool_lower,
+        int(start_ts),
+        int(end_ts),
+        int(args.subgraph_page_size),
+        cur_swap,
+        cur_mint,
+        cur_burn,
+    )
+
+    def flush_buffer() -> None:
+        nonlocal buf, cur_L, cur_sqrt, cur_tick, events_written, last_written_key, last_print
+
+        if not buf:
+            return
+
+        # Convert buffer to DataFrame and enforce ordering.
+        df = pd.DataFrame(buf)
+        df = df.sort_values(["blockNumber", "logIndex"]).reset_index(drop=True)
+        # Defensive: subgraph paging glitches can yield duplicates. A pool log is
+        # uniquely identified by (blockNumber, logIndex).
+        df = df.drop_duplicates(subset=["blockNumber", "logIndex"], keep="first").reset_index(drop=True)
+
+        print(
+            f"Flushing {len(df):,} events (blocks {int(df['blockNumber'].min()):,}–{int(df['blockNumber'].max()):,})…",
+            flush=True,
+        )
+
+        # Skip anything already written (resume robustness).
+        if last_written_key is not None:
+            b0, l0 = last_written_key
+            mask = (df["blockNumber"] > b0) | ((df["blockNumber"] == b0) & (df["logIndex"] > l0))
+            df = df.loc[mask].reset_index(drop=True)
+            if df.empty:
+                buf = []
+                return
+
+        # Normalize addresses.
+        for col in ("origin", "sender", "recipient", "owner"):
+            if col in df.columns:
+                df[col] = df[col].map(checksum_or_none)
+
+        # Convert BigDecimal amounts -> raw units (ints).
+        def _conv_amount0(x: Any) -> Optional[int]:
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                return None
+            return to_raw_units(str(x), int(token0_decimals), strict=bool(args.strict_amount_conversion))
+
+        def _conv_amount1(x: Any) -> Optional[int]:
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                return None
+            return to_raw_units(str(x), int(token1_decimals), strict=bool(args.strict_amount_conversion))
+
+        df["amount0"] = df["amount0"].map(_conv_amount0)
+        df["amount1"] = df["amount1"].map(_conv_amount1)
+
+        # Fill Swap liquidity via RPC logs (required for running-state).
+        swaps = df["eventType"] == "Swap"
+        if swaps.any():
+            start_block = int(df.loc[swaps, "blockNumber"].min())
+            end_block = int(df.loc[swaps, "blockNumber"].max())
+            n_swaps = int(swaps.sum())
+            print(f"  RPC: fetching Swap.liquidity for {n_swaps:,} swaps (blocks {start_block:,}–{end_block:,})…", flush=True)
+            liq_map = fetch_swap_liquidity_map(
+                w3,
+                pool_checksum,
+                start_block,
+                end_block,
+                chunk_blocks=int(args.rpc_swap_log_chunk_blocks),
+                rpc=rpc,
+            )
+            # IMPORTANT: keep dtype=object to avoid float rounding of huge uint128 values.
+            swap_index = df.index[swaps]
+            liq_values = []
+            for r in df.loc[swaps, ["blockNumber", "logIndex"]].itertuples(index=False):
+                liq_values.append(liq_map.get((int(r.blockNumber), int(r.logIndex))))
+            df.loc[swap_index, "liquidityAfter_event"] = pd.Series(liq_values, index=swap_index, dtype=object)
+
+            missing = int(df.loc[swaps, "liquidityAfter_event"].isna().sum())
+            if missing:
+                # Fallback: per-block fetch for blocks that still have missing swaps.
+                miss_blocks = sorted(df.loc[swaps & df["liquidityAfter_event"].isna(), "blockNumber"].unique().tolist())
+                for bn in miss_blocks:
+                    # Reuse the already-decoded range fetcher for this single block (cheap).
+                    one = fetch_swap_liquidity_map(w3, pool_checksum, int(bn), int(bn), chunk_blocks=1, rpc=rpc)
+                    for (bb, li), v in one.items():
+                        liq_map[(bb, li)] = v
+                    # Re-fill missing swaps for that block using dtype=object.
+                    block_mask = swaps & (df["blockNumber"] == bn) & df["liquidityAfter_event"].isna()
+                    if block_mask.any():
+                        idx = df.index[block_mask]
+                        vals = []
+                        for r in df.loc[block_mask, ["blockNumber", "logIndex"]].itertuples(index=False):
+                            vals.append(liq_map.get((int(r.blockNumber), int(r.logIndex))))
+                        df.loc[idx, "liquidityAfter_event"] = pd.Series(vals, index=idx, dtype=object)
+
+            filled = int(df.loc[swaps, "liquidityAfter_event"].notna().sum())
+            still_missing = int(df.loc[swaps, "liquidityAfter_event"].isna().sum())
+
+            # Last-resort fallback: use the Web3 multi-provider (independent from
+            # QuarantinedRPC) for any blocks still missing after quarantine exhaustion.
+            if still_missing:
+                print(f"  RPC: {still_missing:,} swaps still missing; trying w3 provider fallback…", flush=True)
+                miss_blocks2 = sorted(
+                    df.loc[swaps & df["liquidityAfter_event"].isna(), "blockNumber"].unique().tolist()
+                )
+                for bn in miss_blocks2:
+                    try:
+                        one = fetch_swap_liquidity_map(
+                            w3, pool_checksum, int(bn), int(bn), chunk_blocks=1, rpc=None,
+                        )
+                        for (bb, li), v in one.items():
+                            liq_map[(bb, li)] = v
+                        block_mask = swaps & (df["blockNumber"] == bn) & df["liquidityAfter_event"].isna()
+                        if block_mask.any():
+                            idx = df.index[block_mask]
+                            vals = [
+                                liq_map.get((int(r.blockNumber), int(r.logIndex)))
+                                for r in df.loc[block_mask, ["blockNumber", "logIndex"]].itertuples(index=False)
+                            ]
+                            df.loc[idx, "liquidityAfter_event"] = pd.Series(vals, index=idx, dtype=object)
+                    except Exception as exc:
+                        print(f"  ⚠️  w3 fallback failed for block {bn}: {exc}", flush=True)
+
+                filled = int(df.loc[swaps, "liquidityAfter_event"].notna().sum())
+                still_missing = int(df.loc[swaps, "liquidityAfter_event"].isna().sum())
+
+            if still_missing:
+                print(f"  RPC: filled {filled:,}/{n_swaps:,} swap liquidity (missing {still_missing:,})", flush=True)
+            else:
+                print(f"  RPC: filled {filled:,}/{n_swaps:,} swap liquidity", flush=True)
+
+        # Ensure gas fields exist (left empty; enrich later via scripts/add_gas.py).
+        for c in ("gasUsed", "gasPrice", "effectiveGasPrice"):
+            if c not in df.columns:
+                df[c] = None
+
+        # Running state columns
+        df, cur_L, cur_sqrt, cur_tick = compute_running_state(df, int(cur_L), int(cur_sqrt), int(cur_tick))
+
+        # Schema stability + append
+        df_out = ensure_schema_columns(df)
+        csv_append(df_out, out_csv)
+
+        events_written += int(len(df_out))
+        last_row = df_out.iloc[-1]
+        last_written_key = (int(last_row["blockNumber"]), int(last_row["logIndex"]))
+
+        # Checkpoint update (cursor ids correspond to last *streamed* events,
+        # but we only persist at flush boundaries so they are safe to resume).
+        ckpt_payload = {
+            "ckpt_version": 2,
+            "pool": pool_lower,
+            "start_ts": int(start_ts),
+            "end_ts": int(end_ts),
+            "graph_url": str(args.graph_url).strip(),
+            "out_csv": out_csv,
+            "token0_decimals": int(token0_decimals),
+            "token1_decimals": int(token1_decimals),
+            "cur_L": int(cur_L),
+            "cur_sqrt": int(cur_sqrt),
+            "cur_tick": int(cur_tick),
+            "cursor": {
+                "swap_last_id": str(cur_swap.last_id or ""),
+                "mint_last_id": str(cur_mint.last_id or ""),
+                "burn_last_id": str(cur_burn.last_id or ""),
+            },
+            "events_written": int(events_written),
+            "last_written": {"blockNumber": int(last_row["blockNumber"]), "logIndex": int(last_row["logIndex"])},
+            "updated_at": int(time.time()),
+        }
+        save_checkpoint_atomic(ckpt_path, ckpt_payload)
+
+        # Progress print
+        now = time.time()
+        if now - last_print > 5.0:
+            elapsed = now - t0
+            rate = events_written / elapsed if elapsed > 0 else 0.0
+            print(f"  ✓ wrote {len(df_out):,} rows (total {events_written:,}) | rate ~{rate:,.0f} rows/s", flush=True)
+            last_print = now
+
+        buf = []
+
+    max_events = int(args.max_events or 0)
+
+    try:
+        print("Streaming events from subgraph…", flush=True)
+        for etype, ev in stream:
+            streamed_total += 1
+            bn = int(ev["transaction"]["blockNumber"])
+            li = int(ev.get("logIndex") or 0)
+
+            # Skip anything already written (resume robustness).
+            if last_written_key is not None and (bn, li) <= last_written_key:
+                continue
+
+            base = {
+                "blockNumber": bn,
+                "logIndex": li,
+                "timestamp": int(ev["timestamp"]),
+                "transactionHash": str(ev["transaction"]["id"]),
+                "origin": ev.get("origin"),
+                "gasUsed": None,
+                "gasPrice": None,
+                "effectiveGasPrice": None,
+            }
+
+            if etype == "swap":
+                row = {
+                    **base,
+                    "eventType": "Swap",
+                    "sender": ev.get("sender"),
+                    "owner": None,
+                    "recipient": ev.get("recipient"),
+                    "amount0": ev.get("amount0"),
+                    "amount1": ev.get("amount1"),
+                    "sqrtPriceX96_event": int(ev["sqrtPriceX96"]),
+                    "tick_event": int(ev["tick"]),
+                    "liquidityAfter_event": None,  # filled via RPC logs on flush
+                    "tickLower": None,
+                    "tickUpper": None,
+                    "liquidityDelta": None,
+                }
+            elif etype == "mint":
+                row = {
+                    **base,
+                    "eventType": "Mint",
+                    "sender": ev.get("sender"),
+                    "owner": ev.get("owner"),
+                    "recipient": None,
+                    "amount0": ev.get("amount0"),
+                    "amount1": ev.get("amount1"),
+                    "sqrtPriceX96_event": None,
+                    "tick_event": None,
+                    "liquidityAfter_event": None,
+                    "tickLower": int(ev["tickLower"]),
+                    "tickUpper": int(ev["tickUpper"]),
+                    "liquidityDelta": int(ev["amount"]),
+                }
+            else:  # burn
+                row = {
+                    **base,
+                    "eventType": "Burn",
+                    "sender": None,
+                    "owner": ev.get("owner"),
+                    "recipient": None,
+                    "amount0": ev.get("amount0"),
+                    "amount1": ev.get("amount1"),
+                    "sqrtPriceX96_event": None,
+                    "tick_event": None,
+                    "liquidityAfter_event": None,
+                    "tickLower": int(ev["tickLower"]),
+                    "tickUpper": int(ev["tickUpper"]),
+                    "liquidityDelta": -int(ev["amount"]),
+                }
+
+            buf.append(row)
+
+            if heartbeat_s > 0:
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_s:
+                    ts = int(ev.get("timestamp") or 0)
+                    ts_s = str(pd.to_datetime(ts, unit="s", utc=True)) if ts else "?"
+                    print(
+                        f"  … streamed {streamed_total:,} events | buffered {len(buf):,} | written {events_written:,} | last {bn:,}:{li} @ {ts_s}",
+                        flush=True,
+                    )
+                    last_heartbeat = now
+
+            if len(buf) >= int(args.flush_every_events):
+                flush_buffer()
+                if max_events and events_written >= max_events:
+                    break
+    finally:
+        flush_buffer()
+
+    elapsed = time.time() - t0
+    rate = events_written / elapsed if elapsed > 0 else 0.0
+    print(f"✅ Completed. Total rows written: {events_written:,} | elapsed: {elapsed:.1f}s | avg rate: {rate:,.0f} rows/s", flush=True)
+    print(f"Output CSV: {out_csv}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

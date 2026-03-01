@@ -67,9 +67,11 @@ $$
 
 `scripts/data_fetch.py` fetches `Swap`, `Mint`, and `Burn` logs for a single Uniswap v3 pool over a time range and writes a per-event CSV. It also derives “running state” columns such as `L_before` and `sqrt_before` by walking the event stream in strict `(blockNumber, logIndex)` order.
 
-- `scripts/data_fetch.py` also resolves **transaction metadata**:
-  - `origin` (tx sender) is **always** fetched via `eth_getTransaction`
-  - gas fields (`gasUsed`, `gasPrice`, `effectiveGasPrice`) are fetched **by default** via receipts; set `SKIP_GAS_DATA = True` in `scripts/data_fetch.py` to skip (much faster)
+The script uses a **subgraph-first** strategy:
+
+- The Uniswap v3 subgraph provides the canonical event stream (including `origin`, amounts, ticks, sqrtPriceX96).
+- RPC calls (`eth_getLogs`) are used **only** for `Swap.liquidity` (active liquidity after each swap), which the subgraph does not reliably expose. These calls go through a quarantine-aware RPC client (`scripts/quarantined_rpc.py`) that respects `Retry-After` on HTTP 429 and rotates endpoints.
+- Gas fields (`gasUsed`, `gasPrice`, `effectiveGasPrice`) are **left empty** by default; enrich later with `scripts/add_gas.py`.
 
 Optional / post-processing enrichments:
 
@@ -119,7 +121,7 @@ Notes:
 
 The repo is script-first (not a packaged library). The main entry points:
 
-- `scripts/data_fetch.py`: fetch pool events + running state + tx metadata (`origin` always; gas fields by default) to CSV (writes under `data/`)
+- `scripts/data_fetch.py`: fetch pool events + running state (subgraph-first; RPC only for swap liquidity; gas fields left empty) to CSV (writes under `data/`)
 - `scripts/add_origin.py`, `scripts/add_gas.py`: backfill those metadata fields for an existing CSV (writes under `data/`)
 - `scripts/mev_collect.py`: detect patterns + compute theory fields; writes “tidy” CSVs to `mev_out/`
 - `scripts/section3_empirical_simple.py`: Plotly scatter of profit vs `|σ|` by strategy
@@ -134,20 +136,21 @@ Assumption: you have a working Python environment with the scientific stack and 
 conda activate main
 ```
 
-### 1) Fetch a pool dataset (requires RPC access)
+### 1) Fetch a pool dataset (requires subgraph + RPC access)
 
-`scripts/data_fetch.py` is configured via constants at the top of the file (pool address, time range, batching). RPC endpoints are read from `MEV_RPC_URLS` (preferred; space-separated) or `WEB3_PROVIDER_URI` (single endpoint). After setting those:
+`scripts/data_fetch.py` reads configuration from environment variables and CLI flags. The subgraph endpoint is set via `UNIV3_GRAPH_URL` (or `--graph-url`); RPC endpoints are read from `MEV_RPC_URLS` (preferred; space-separated) or `WEB3_PROVIDER_URI` (single endpoint). After setting those:
 
 ```bash
+export UNIV3_GRAPH_URL="https://gateway.thegraph.com/api/<KEY>/subgraphs/id/..."
 export MEV_RPC_URLS="https://<RPC_1> https://<RPC_2>"
 python scripts/data_fetch.py
 ```
 
-This writes a CSV like `data/raw/univ3_<POOL_ADDR>.csv` and a resume checkpoint under `data/checkpoints/`.
+This writes a CSV like `data/raw/univ3_<POOL_ADDR>.csv` and a resume checkpoint under `data/checkpoints/`. Re-running the same command resumes from where it left off via the checkpoint.
 
 ### 2) Optional: add origin / gas
 
-Note: current `scripts/data_fetch.py` already writes `origin` by default and fetches gas fields unless `SKIP_GAS_DATA = True`. Use `scripts/add_origin.py` / `scripts/add_gas.py` only if you’re enriching an existing CSV (or backfilling after skipping gas).
+Note: `scripts/data_fetch.py` writes `origin` (from the subgraph) but leaves gas fields empty. Use `scripts/add_gas.py` to backfill gas data, and `scripts/add_origin.py` only if enriching an external CSV that lacks `origin`.
 
 Both `scripts/add_origin.py` and `scripts/add_gas.py` support incremental resume via checkpoints. Defaults are repo-relative; use CLI flags to override.
 
