@@ -4,7 +4,7 @@
 Section 3 — Interactive scatter by STRATEGY (Plotly, color only)
 
 Creates a single interactive scatter plot of Profit vs |σ| where **color** encodes the strategy:
-- JIT ceiling (token0-normalized): blue
+- JIT (realized PnL): blue
 - Classical Sandwich (realized PnL): orange
 - JIT-Sandwich (realized PnL): green
 - Back-run Arbitrage (observed PnL): red
@@ -14,18 +14,20 @@ Saves as an interactive HTML (default) and optionally a PNG if kaleido is instal
 
 Inputs (CSV)
 ------------
-• --in-jit       : jit_cycles_tidy.csv    (expects columns: sigma_gross, profit_per_x0)
-• --in-sand      : sandwich_attacks_tidy.csv
+• --in-jit       : jit_cycles_tidy_5.csv (preferred; falls back to legacy names)
+                    (expects columns: sigma_gross, profit_total_per_x0)
+• --in-sand      : sandwich_attacks_tidy_5.csv (preferred; falls back to legacy names)
                     (expects columns: pattern_type in {'Classical','JIT-Sandwich'},
                                      sigma_gross, profit_per_x0)
-• --in-backrun   : reverse_backruns_tidy.csv (expects: sigma_gross, profit_obs_per_x0) [optional]
+• --in-backrun   : reverse_backruns_tidy_5.csv (preferred; falls back to legacy names)
+                    (expects: sigma_gross, profit_obs_per_x0) [optional]
 
 Usage
 -----
-python section3_scatter_plotly_by_strategy.py \
-  --in-jit ./mev_out/jit_cycles_tidy.csv \
-  --in-sand ./mev_out/sandwich_attacks_tidy.csv \
-  --in-backrun ./mev_out/reverse_backruns_tidy.csv \
+python scripts/section3_empirical_simple.py \
+  --in-jit ./mev_out/jit_cycles_tidy_5.csv \
+  --in-sand ./mev_out/sandwich_attacks_tidy_5.csv \
+  --in-backrun ./mev_out/reverse_backruns_tidy_5.csv \
   --out ./mev_out/section3_scatter_by_strategy.html \
   --png-out ./mev_out/section3_scatter_by_strategy.png \
   --show
@@ -34,6 +36,7 @@ python section3_scatter_plotly_by_strategy.py \
 from __future__ import annotations
 import os
 import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -57,6 +60,19 @@ def load_csv(path: str) -> pd.DataFrame:
     except Exception as e:
         print(f"[warn] Failed reading {path}: {e}")
         return pd.DataFrame()
+
+def discover_tidy_path(mev_out: Path, stem: str) -> Path:
+    """Prefer current `mev_collect.py` outputs, but keep backward-compatible fallbacks."""
+    candidates = [
+        mev_out / f'{stem}_5.csv',
+        mev_out / f'{stem}_5.0.csv',
+        mev_out / f'{stem}.csv',
+        mev_out / f'{stem}_None.csv',
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
 
 # ---------------- Builders ----------------
 
@@ -108,11 +124,17 @@ def prepare_backrun(df_br: pd.DataFrame, abs_sigma: bool) -> pd.DataFrame:
 # ---------------- Main ----------------
 
 def main():
+    repo_root = Path(__file__).resolve().parents[1]
+    mev_out = repo_root / "mev_out"
+    default_jit = discover_tidy_path(mev_out, 'jit_cycles_tidy')
+    default_sand = discover_tidy_path(mev_out, 'sandwich_attacks_tidy')
+    default_br = discover_tidy_path(mev_out, 'reverse_backruns_tidy')
+
     ap = argparse.ArgumentParser(description="Interactive scatter: Profit vs |σ|, color = strategy (Plotly)")
-    ap.add_argument('--in-jit', default='./mev_out/jit_cycles_tidy_None.csv')
-    ap.add_argument('--in-sand', default='./mev_out/sandwich_attacks_tidy_None.csv')
-    ap.add_argument('--in-backrun', default='./mev_out/reverse_backruns_tidy_None.csv')
-    ap.add_argument('--out', default='./mev_out/section3_scatter_by_strategy.html',
+    ap.add_argument('--in-jit', default=str(default_jit), help='Path to JIT tidy CSV (default: %(default)s).')
+    ap.add_argument('--in-sand', default=str(default_sand), help='Path to sandwich tidy CSV (default: %(default)s).')
+    ap.add_argument('--in-backrun', default=str(default_br), help='Path to reverse back-run tidy CSV (default: %(default)s).')
+    ap.add_argument('--out', default=str(mev_out / 'section3_scatter_by_strategy.html'),
                     help='Output HTML path for the interactive figure.')
     ap.add_argument('--png-out', default='',
                     help='Optional static PNG path (requires kaleido).')
@@ -120,8 +142,13 @@ def main():
     ap.add_argument('--width', type=int, default=1100, help='Figure width in px (default: 1100)')
     ap.add_argument('--height', type=int, default=700, help='Figure height in px (default: 700)')
     ap.add_argument('--show', action='store_true', help='Open the figure after saving')
-    ap.add_argument('--fee-bps', type=float, default=0.0005,
-                    help='Pool fee tier in basis points; used for reference guide lines')
+    ap.add_argument(
+        '--fee-bps', '--fee_bps',
+        dest='fee_bps',
+        type=float,
+        default=5.0,
+        help="Pool fee tier used for σ-threshold guide lines. Accepts basis points (e.g., 5, 30, 100) or a fraction (e.g., 0.0005).",
+    )
     args = ap.parse_args()
 
     # Load CSVs
@@ -188,41 +215,30 @@ def main():
     )
 
     if args.fee_bps is not None:
-        half_fee = args.fee_bps / 2.0
-        min_color = '#1f77b4'
-        tier_color = '#d62728'
-        fig.add_vline(
-            x=half_fee,
-            line_dash='dash',
-            line_color=min_color,
-        )
-        fig.add_vline(
-            x=args.fee_bps,
-            line_dash='dash',
-            line_color=tier_color,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[None],
-                y=[None],
-                mode='lines',
-                line=dict(color=min_color, dash='dash'),
-                name='σ min br',
-                hoverinfo='skip',
-                showlegend=True,
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[None],
-                y=[None],
-                mode='lines',
-                line=dict(color=tier_color, dash='dash'),
-                name='Fee Tier',
-                hoverinfo='skip',
-                showlegend=True,
-            )
-        )
+        # Interpret `--fee-bps` robustly: users may pass 5 (bps) or 0.0005 (fraction).
+        fee_in = float(args.fee_bps)
+        f = (fee_in / 10_000.0) if fee_in >= 1.0 else fee_in
+        if not (0.0 <= f < 1.0):
+            raise SystemExit(f"Invalid fee fraction inferred from --fee-bps={args.fee_bps!r}: f={f}.")
+        r = 1.0 - f
+
+        # Paper §3: back-run profitability threshold (Eq. 13):
+        #   σ_min^br = (1/sqrt(r) - 1)/r ≈ f/2 for small f.
+        sigma_min_br = (1.0 / np.sqrt(r) - 1.0) / r
+
+        # Sandwich profit turns on at σ > σ_min(ε); as ε→0+, σ_min → (1-r)/r^2 ≈ f.
+        sigma_min_sand_eps0 = (1.0 - r) / (r * r)
+
+        c_br = '#1f77b4'
+        c_sand = '#d62728'
+        fig.add_vline(x=sigma_min_br, line_dash='dash', line_color=c_br)
+        fig.add_vline(x=sigma_min_sand_eps0, line_dash='dash', line_color=c_sand)
+
+        # Dummy traces to label the vertical guide lines in the legend.
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', line=dict(color=c_br, dash='dash'),
+                                 name='σ_min back-run', hoverinfo='skip', showlegend=True))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', line=dict(color=c_sand, dash='dash'),
+                                 name='σ_min sandwich (ε→0)', hoverinfo='skip', showlegend=True))
 
     # Save HTML
     out_html = args.out

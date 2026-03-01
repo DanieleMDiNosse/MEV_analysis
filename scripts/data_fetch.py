@@ -72,7 +72,7 @@ Event-specific payload:
 - `sqrtPriceX96_event` (int|None): For `Swap`: the new sqrt price Q64.96 after the swap.
   For `Mint`/`Burn`: `None`.
 - `tick_event` (int|None): For `Swap`: the new tick after the swap. Else `None`.
-- `liquidityAfter_event` (int|None): For `Swap`: pool liquidity AFTER the swap event.
+- `liquidityAfter_event` (int|None): For `Swap`: pool active liquidity AFTER the swap event.
   For `Mint`/`Burn`: `None`.
 - `tickLower` (int|None): For `Mint`/`Burn`: lower tick of the position. Else `None`.
 - `tickUpper` (int|None): For `Mint`/`Burn`: upper tick of the position. Else `None`.
@@ -85,6 +85,7 @@ Running-state (derived):
 """
 
 import os, json, tempfile, time
+from pathlib import Path
 from typing import Union, Optional, Dict, Any, List, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -95,12 +96,19 @@ from web3 import Web3
 from web3._utils.events import get_event_data
 from eth_defi.provider.multi_provider import create_multi_provider_web3
 
-# ---------------- Config ----------------
-JSON_RPC_LINE = " ".join([
-    "https://eth.llamarpc.com/sk_llama_252714c1e64c9873e3b21ff94d7f1a3f",
-    "https://mainnet.infura.io/v3/5f38fb376e0548c8a828112252a6a588",
-    # Add more endpoints if desired
-])
+# ---------------- RPC configuration ----------------
+# Do not hard-code RPC keys/secrets in the repository. Prefer environment variables:
+# - MEV_RPC_URLS: space-separated HTTPS endpoints (preferred; enables failover)
+# - WEB3_PROVIDER_URI: a single HTTPS endpoint
+#
+# If neither is set, we fall back to a small list of public endpoints (rate-limited).
+DEFAULT_RPC_URLS = [
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth",
+]
+JSON_RPC_LINE = (os.environ.get("MEV_RPC_URLS") or os.environ.get("WEB3_PROVIDER_URI") or "").strip()
+if not JSON_RPC_LINE:
+    JSON_RPC_LINE = " ".join(DEFAULT_RPC_URLS)
 
 POOL_ADDR = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"  # USDC/WETH 0.05%
 # POOL_ADDR = "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8"  # USDC/WETH 0.3%
@@ -115,15 +123,23 @@ CHUNK_SIZE_BLOCKS = 500  # Reduced to avoid provider limits
 PARALLEL_WORKERS = 8      # Parallel chunk processing
 BATCH_RECEIPT_SIZE = 100  # Batch receipt/tx fetching
 
-# Checkpointing
-CHECKPOINT_PATH = "univ3_checkpoint.json"
-OUT_CSV = f"univ3_{POOL_ADDR}.csv"
+# Checkpointing / outputs (repo-relative so this script is runnable from any CWD)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+CHECKPOINT_PATH = str(DATA_DIR / "checkpoints" / "univ3_checkpoint.json")
+OUT_CSV = str(DATA_DIR / "raw" / f"univ3_{POOL_ADDR}.csv")
+
+# Ensure directories exist early (before any writes).
+Path(CHECKPOINT_PATH).parent.mkdir(parents=True, exist_ok=True)
+Path(OUT_CSV).parent.mkdir(parents=True, exist_ok=True)
 
 # Option to skip gas data entirely (HUGE speedup if True)
 SKIP_GAS_DATA = False  # Set True to skip gasUsed/gasPrice/effectiveGasPrice
 
 # ---------------- Setup ----------------
 w3 = create_multi_provider_web3(JSON_RPC_LINE, request_kwargs={"timeout": 60.0})
+if w3.eth.chain_id != 1:
+    raise RuntimeError(f"Connected chain is not Ethereum mainnet (chain_id={w3.eth.chain_id}).")
 POOL = Web3.to_checksum_address(POOL_ADDR)
 
 Q96 = 1 << 96
@@ -622,7 +638,7 @@ def process_window(from_block: int, to_block: int,
     }
 
 # ---------------- Main execution ----------------
-print(f"Starting optimized data fetch for pool {POOL_ADDR}")
+print(f"Starting data fetch for pool {POOL_ADDR}")
 print(f"Date range: {pd.to_datetime(START_TS, unit='s')} to {pd.to_datetime(END_TS, unit='s')}")
 print(f"Block range: {START_BLOCK} to {END_BLOCK} (~{END_BLOCK - START_BLOCK:,} blocks)")
 print(f"Settings: CHUNK_SIZE={CHUNK_SIZE_BLOCKS}, WORKERS={PARALLEL_WORKERS}, SKIP_GAS={SKIP_GAS_DATA}")

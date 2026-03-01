@@ -20,9 +20,9 @@ What this script does
   Section 3. Formulas/eq. numbers below refer to that Section.
 
 • **Outputs computation-ready CSVs** in `--outdir`:
-  - `jit_cycles_tidy.csv`
-  - `sandwich_attacks_tidy.csv`
-  - `reverse_backruns_tidy.csv`
+  - `jit_cycles_tidy_<fee_bps>.csv`
+  - `sandwich_attacks_tidy_<fee_bps>.csv`
+  - `reverse_backruns_tidy_<fee_bps>.csv`
   Each already contains the raw anchors (tx hashes, directions, amounts) **plus** the theory fields.
 
 NEW:
@@ -42,6 +42,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import sys
 import argparse
 import math
+from pathlib import Path
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,6 +54,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 Q96 = 2 ** 96
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------------
 # Helpers: schema & numeric accessors
@@ -739,9 +741,9 @@ def augment_reverse_backruns(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.D
     if df.empty:
         return df
 
-    f = (fee_bps or 5.0) / 10_000.0
     if fee_bps is None:
-        print("⚠️  --fee-bps not provided; defaulting to 5 bps (0.05%).")
+        fee_bps = 5.0
+    f = float(fee_bps) / 10_000.0
     r = 1.0 - f
 
     x0 = df['x0'].astype(float).to_numpy()
@@ -750,18 +752,18 @@ def augment_reverse_backruns(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.D
 
     dir_x2y = (df['victim_dir'].astype(str).values == 'x2y')
 
-    S0_net = df['S_net_token0'].astype(float).to_numpy()
-    S1_net = df['S_net_token1'].astype(float).to_numpy()
-    S0_gross = _safe_div(S0_net, r)
-    S1_gross = _safe_div(S1_net, r)
+    # NOTE: Swap `amount0/amount1` are *gross* pool deltas. In the Section 3 model,
+    # the fee is applied on the input side in the invariant via `r = 1 - f`.
+    S0_gross = df['S_net_token0'].astype(float).to_numpy()
+    S1_gross = df['S_net_token1'].astype(float).to_numpy()
 
-    sigma0_net   = _safe_div(S0_net,   x0)
     sigma0_gross = _safe_div(S0_gross, x0)
-    sigma1_net   = _safe_div(S1_net,   y0)
     sigma1_gross = _safe_div(S1_gross, y0)
+    sigma0_net = r * sigma0_gross
+    sigma1_net = r * sigma1_gross
 
-    sigma_native_net   = np.where(dir_x2y, sigma0_net,   sigma1_net)
     sigma_native_gross = np.where(dir_x2y, sigma0_gross, sigma1_gross)
+    sigma_native_net = np.where(dir_x2y, sigma0_net, sigma1_net)
 
     I_theory = np.where(
         dir_x2y,
@@ -785,9 +787,10 @@ def augment_reverse_backruns(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.D
     back_a1 = df['back_a1'].astype(float).to_numpy()
     back_x2y = (back_a0 > 0) & (back_a1 < 0)
     back_y2x = ~back_x2y
-    x_cost = np.where(back_x2y,  back_a0 / r, 0.0)
+    # Trader cashflows use the *gross* pool deltas (no `/r` conversion needed).
+    x_cost = np.where(back_x2y,  back_a0, 0.0)
     x_get  = np.where(back_y2x, -back_a0,     0.0)
-    y_cost = np.where(back_y2x,  back_a1 / r, 0.0)
+    y_cost = np.where(back_y2x,  back_a1, 0.0)
     y_get  = np.where(back_x2y, -back_a1,     0.0)
     profit_obs_token0 = (x_get - x_cost) + _safe_div((y_get - y_cost), P0)
     profit_obs_per_x0 = _safe_div(profit_obs_token0, x0)
@@ -862,9 +865,9 @@ def augment_jit(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    f = (fee_bps or 5.0) / 10_000.0
     if fee_bps is None:
-        print("⚠️  --fee-bps not provided; defaulting to 5 bps (0.05%).")
+        fee_bps = 5.0
+    f = float(fee_bps) / 10_000.0
     r = 1.0 - f
 
     # --- Pre-computation of state variables ---
@@ -872,17 +875,20 @@ def augment_jit(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.DataFrame:
     y0 = df['y0'].astype(float).to_numpy()
     P0 = _safe_div(y0, x0)
 
-    S0_net = df['S_net_token0'].astype(float).to_numpy()
-    S1_net = df['S_net_token1'].astype(float).to_numpy()
-    S0_gross = _safe_div(S0_net, r)
-    S1_gross = _safe_div(S1_net, r)
+    # NOTE: Swap `amount0/amount1` are *gross* pool deltas. The input fee is
+    # applied only in the invariant via `r = 1 - f` (see paper §3 and `change.md`).
+    S0_gross = df['S_net_token0'].astype(float).to_numpy()
+    S1_gross = df['S_net_token1'].astype(float).to_numpy()
 
-    dir_x2y = S0_net >= 0
+    dir_x2y = S0_gross >= 0
     victim_dir = np.where(dir_x2y, 'x2y', 'y2x')
 
     sigma0_gross = _safe_div(S0_gross, x0)
     sigma1_gross = _safe_div(S1_gross, y0)
     sigma_native_gross = np.where(dir_x2y, sigma0_gross, sigma1_gross)
+    sigma0_net = r * sigma0_gross
+    sigma1_net = r * sigma1_gross
+    sigma_native_net = r * sigma_native_gross
     share = df['attacker_liq_share'].astype(float).to_numpy()
     
     # --- 1. Calculate Fee Revenue Component ---
@@ -913,8 +919,6 @@ def augment_jit(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.DataFrame:
     profit_total_per_x0 = _safe_div(profit_total_token0, x0)
 
     # --- Theory Metrics (unchanged) ---
-    sigma0_net = _safe_div(S0_net, x0)
-    sigma1_net = _safe_div(S1_net, y0)
     I_theory = np.where(
         dir_x2y,
         price_impact_x2y(r, sigma_native_gross),
@@ -925,7 +929,7 @@ def augment_jit(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.DataFrame:
         fee_fraction=f,
         r=r,
         victim_dir=victim_dir,
-        sigma_net=sigma_native_gross * r,
+        sigma_net=sigma_native_net,
         sigma_gross=sigma_native_gross,
         sigma0_net=sigma0_net,
         sigma0_gross=sigma0_gross,
@@ -941,9 +945,9 @@ def augment_jit(df: pd.DataFrame, fee_bps: Optional[float]) -> pd.DataFrame:
 def augment_sandwich(df: pd.DataFrame, fee_bps: Optional[float], gamma: float, grid_n: int) -> pd.DataFrame:
     if df.empty:
         return df
-    f = (fee_bps or 5.0) / 10_000.0
     if fee_bps is None:
-        print("⚠️  --fee-bps not provided; defaulting to 5 bps (0.05%).")
+        fee_bps = 5.0
+    f = float(fee_bps) / 10_000.0
     r = 1.0 - f
 
     x0 = df['x0'].astype(float).to_numpy()
@@ -955,34 +959,31 @@ def augment_sandwich(df: pd.DataFrame, fee_bps: Optional[float], gamma: float, g
         dir_vals = df['front_dir'].astype(str).to_numpy()
         victim_dir = np.where(dir_vals == 'swap_x2y', 'x2y', 'y2x')
     else:
-        S0_net_tmp = df['S_net_token0'].astype(float).to_numpy()
-        victim_dir = np.where(S0_net_tmp >= 0, 'x2y', 'y2x')
+        S0_gross_tmp = df['S_net_token0'].astype(float).to_numpy()
+        victim_dir = np.where(S0_gross_tmp >= 0, 'x2y', 'y2x')
     dir_x2y = (victim_dir == 'x2y')
 
-    # Pool deltas (front/back) — convert to trader cashflows by undoing input fee on input side
+    # Pool deltas (front/back) — use *gross* deltas for trader cashflows.
     front_a0 = df['front_a0'].astype(float).fillna(0.0).to_numpy()
     back_a0  = df['back_a0'].astype(float).fillna(0.0).to_numpy()
     front_a1 = df['front_a1'].astype(float).fillna(0.0).to_numpy()
     back_a1  = df['back_a1'].astype(float).fillna(0.0).to_numpy()
 
-    x_cost = np.where(dir_x2y,  front_a0 / r,             back_a0 / r)   # trader input in X
-    x_get  = np.where(dir_x2y, -back_a0,                 -front_a0)      # trader output in X
-    y_cost = np.where(dir_x2y,  back_a1 / r,              front_a1 / r)  # trader input in Y
-    y_get  = np.where(dir_x2y, -front_a1,                -back_a1)       # trader output in Y
+    # Base sandwich PnL in token0 (from the two attacker swaps only).
+    a0_in  = np.maximum(front_a0, 0.0) + np.maximum(back_a0, 0.0)
+    a0_out = np.maximum(-front_a0, 0.0) + np.maximum(-back_a0, 0.0)
+    a1_in  = np.maximum(front_a1, 0.0) + np.maximum(back_a1, 0.0)
+    a1_out = np.maximum(-front_a1, 0.0) + np.maximum(-back_a1, 0.0)
+    profit_token0_base = (a0_out - a0_in) + _safe_div((a1_out - a1_in), P0)
 
-    # Base sandwich PnL in token0
-    profit_token0_base = (x_get - x_cost) + _safe_div((y_get - y_cost), P0)
+    # Victim flow and normalized sizes (σ): treat event deltas as *gross*.
+    S0_gross = df['S_net_token0'].astype(float).to_numpy()
+    S1_gross = df['S_net_token1'].astype(float).to_numpy()
 
-    # Victim flow (net → gross) and normalized sizes (σ)
-    S0_net = df['S_net_token0'].astype(float).to_numpy()
-    S1_net = df['S_net_token1'].astype(float).to_numpy()
-    S0_gross = _safe_div(S0_net, r)
-    S1_gross = _safe_div(S1_net, r)
-
-    sigma0_net   = _safe_div(S0_net, x0)
     sigma0_gross = _safe_div(S0_gross, x0)
-    sigma1_net   = _safe_div(S1_net, y0)
     sigma1_gross = _safe_div(S1_gross, y0)
+    sigma0_net = r * sigma0_gross
+    sigma1_net = r * sigma1_gross
 
     sigma_native_net   = np.where(dir_x2y, sigma0_net,   sigma1_net)
     sigma_native_gross = np.where(dir_x2y, sigma0_gross, sigma1_gross)
@@ -1031,10 +1032,15 @@ def augment_sandwich(df: pd.DataFrame, fee_bps: Optional[float], gamma: float, g
                                  _safe_div(br_pi_star_native_units, P0))
     br_pi_star_per_x0 = _safe_div(br_pi_star_token0, x0)
 
+    eps_gross = np.where(
+        dir_x2y,
+        _safe_div(np.abs(front_a0), x0),
+        _safe_div(np.abs(front_a1), y0),
+    )
+    eps_net = r * eps_gross
+
     sand_pi_obs_native = [sandwich_profit_normalized(e, s, r)
-                          for e, s in zip(np.where(dir_x2y, _safe_div(np.abs(front_a0), x0),
-                                                              _safe_div(np.abs(front_a1), y0)) / r,
-                                          sigma_native_gross)]
+                          for e, s in zip(eps_gross, sigma_native_gross)]
     eps_star_list, sand_pi_star_native = [], []
     for s in sigma_native_gross:
         e_star, pi_star = sandwich_profit_star(s, r, gamma, grid_n)
@@ -1085,8 +1091,8 @@ def augment_sandwich(df: pd.DataFrame, fee_bps: Optional[float], gamma: float, g
         # totals
         profit_token0=profit_token0,
         profit_per_x0=profit_per_x0,
-        eps_net=np.where(dir_x2y, _safe_div(np.abs(front_a0), x0), _safe_div(np.abs(front_a1), y0)),
-        eps_gross=np.where(dir_x2y, _safe_div(np.abs(front_a0), x0), _safe_div(np.abs(front_a1), y0)) / r,
+        eps_net=eps_net,
+        eps_gross=eps_gross,
         sigma_net=sigma_native_net,
         sigma_gross=sigma_native_gross,
         sigma0_net=sigma0_net,
@@ -1120,28 +1126,70 @@ def evaluate_eps_max_series(sigmas: pd.Series, gamma: float, r: float) -> pd.Ser
 # CLI & main
 # ---------------------------------------------------------------------
 
+def _discover_default_input_path() -> Path:
+    """Pick a deterministic, repo-relative default input dataset."""
+    candidates = [
+        REPO_ROOT / "data" / "processed" / "univ3_pool_events_with_origin.csv",
+        REPO_ROOT / "data" / "processed" / "univ3_pool_events_with_running_state.csv",
+        REPO_ROOT / "data" / "raw" / "usdc_weth_05.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+
+    raw_dir = REPO_ROOT / "data" / "raw"
+    discovered = sorted(raw_dir.glob("univ3_*.csv")) if raw_dir.exists() else []
+    if discovered:
+        return discovered[0]
+
+    return candidates[0]
+
+
 def parse_args() -> argparse.Namespace:
+    default_in = _discover_default_input_path()
     p = argparse.ArgumentParser(description="Collect JIT cycles and Sandwich attacks + Section 3 metrics (no column normalization).")
-    p.add_argument("--in", dest="in_path", required=True, help="Input CSV, Parquet or Pickle file.")
-    p.add_argument("--outdir", default="./mev_out", help="Output directory.")
-    p.add_argument("--n-jobs", type=int, default=-1, help="Worker processes (-1 = all cores).")
-    p.add_argument("--chunk-size", type=int, default=64, help="Blocks per task chunk to reduce IPC overhead.")
-    p.add_argument("--min-victims", type=int, default=1, help="Min victim swaps for a sandwich (default: 1).")
-    p.add_argument("--fee_bps", type=float, default=None, help="Pool fee tier in basis points (e.g., 5, 30, 100). If omitted, default 5 bps.")
-    p.add_argument("--gamma", type=float, default=0.01, help="Victim slippage tolerance used in theory constraints (default: 0.01 = 1%).")
-    p.add_argument("--grid-npoints", type=int, default=128, help="Grid size to maximize π(ε) under γ (default: 128).")
-    p.add_argument("--quiet", action="store_true", help="Less verbose printing.")
-    p.add_argument("--recompute_jit", action="store_true", help="Recompute jit detectors even if output files exist.")
-    p.add_argument("--recompute_sand", action="store_true", help="Recompute sandwich detectors even if output files exist.")
-    p.add_argument("--recompute_br", action="store_true", help="Recompute back run arbitrage detectors even if output files exist.")
+    p.add_argument("--in", dest="in_path", default=str(default_in), help="Input CSV, Parquet or Pickle file (default: %(default)s).")
+    p.add_argument("--outdir", default=str(REPO_ROOT / "mev_out"), help="Output directory (default: %(default)s).")
+    p.add_argument("--n-jobs", type=int, default=-1, help="Worker processes (-1 = all cores, default: %(default)s).")
+    p.add_argument("--chunk-size", type=int, default=64, help="Blocks per task chunk to reduce IPC overhead (default: %(default)s).")
+    p.add_argument("--min-victims", type=int, default=1, help="Min victim swaps for a sandwich (default: %(default)s).")
+    p.add_argument("--fee-bps", "--fee_bps", dest="fee_bps", type=float, default=5.0, help="Pool fee tier for outputs and formulas; accepts bps (5, 30, 100) or fraction (0.0005) (default: %(default)s).")
+    # NOTE: argparse help strings use %-formatting; escape literal '%' as '%%'.
+    p.add_argument("--gamma", type=float, default=0.01, help="Victim slippage tolerance used in theory constraints (default: %(default)s = 1%%).")
+    p.add_argument("--grid-npoints", type=int, default=128, help="Grid size to maximize π(ε) under γ (default: %(default)s).")
+    p.add_argument("--quiet", action="store_true", default=False, help="Less verbose printing (default: %(default)s).")
+    p.add_argument("--recompute_jit", action="store_true", default=False, help="Recompute jit detectors even if output files exist (default: %(default)s).")
+    p.add_argument("--recompute_sand", action="store_true", default=False, help="Recompute sandwich detectors even if output files exist (default: %(default)s).")
+    p.add_argument("--recompute_br", action="store_true", default=False, help="Recompute back run arbitrage detectors even if output files exist (default: %(default)s).")
     return p.parse_args()
+
+
+def _normalize_fee_bps(fee_value: float) -> float:
+    """Return fee in basis points; accept either bps (>=1) or fraction (<1)."""
+    fee = float(fee_value)
+    if not np.isfinite(fee) or fee < 0.0:
+        raise ValueError(f"Invalid fee value: {fee_value!r}. Use a non-negative float.")
+    if fee < 1.0:
+        return fee * 10_000.0
+    return fee
 
 
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    FEE = str(args.fee_bps)
+    if not Path(args.in_path).exists():
+        raise FileNotFoundError(
+            f"Input dataset not found: {args.in_path}. "
+            "Pass --in explicitly or place a dataset under data/processed or data/raw."
+        )
+
+    fee_bps = _normalize_fee_bps(args.fee_bps)
+    FEE = f"{fee_bps:g}"
+    outdir = Path(args.outdir)
+    jit_cached = outdir / f"jit_cycles_tidy_{FEE}.csv"
+    sand_cached = outdir / f"sandwich_attacks_tidy_{FEE}.csv"
+    br_cached = outdir / f"reverse_backruns_tidy_{FEE}.csv"
 
     # Load (no normalization!)
     print("📥 Loading dataset…")
@@ -1165,19 +1213,19 @@ def main():
 
     # Run detectors
     print("🚀 Starting collectors…")
-    if os.path.exists(f"/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/jit_cycles_tidy_{FEE}.csv") and not args.recompute_jit:
+    if jit_cached.exists() and not args.recompute_jit:
         print("JIT cycles already detected, skipping...")
-        jit_df = pd.read_csv(f"/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/jit_cycles_tidy_{FEE}.csv")
+        jit_df = pd.read_csv(jit_cached, low_memory=False)
     else:
         jit_df = run_detector_mp(df, schema, name='JIT', n_jobs=n_jobs, chunk_size=args.chunk_size, min_victims=args.min_victims, quiet=args.quiet)
-    if os.path.exists(f"/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/jit_sandwich_tidy_{FEE}.csv") and not args.recompute_sand:
+    if sand_cached.exists() and not args.recompute_sand:
         print("Sandwich attacks already detected, skipping...")
-        sand_df = pd.read_csv(f"/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/jit_sandwich_tidy_{FEE}.csv")
+        sand_df = pd.read_csv(sand_cached, low_memory=False)
     else:
         sand_df = run_detector_mp(df, schema, name='SANDWICH', n_jobs=n_jobs, chunk_size=args.chunk_size, min_victims=args.min_victims, quiet=args.quiet)
-    if os.path.exists(f"/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/reverse_backruns_tidy_{FEE}.csv") and not args.recompute_br:
+    if br_cached.exists() and not args.recompute_br:
         print("Reverse back-runs already detected, skipping...")
-        rback_df = pd.read_csv(f"/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/reverse_backruns_tidy_{FEE}.csv")
+        rback_df = pd.read_csv(br_cached, low_memory=False)
     else:
         rback_df = run_detector_mp(df, schema, name='RBACKRUN', n_jobs=n_jobs, chunk_size=args.chunk_size, min_victims=args.min_victims, quiet=args.quiet)
 
@@ -1192,9 +1240,9 @@ def main():
 
     # Augment with Section 3 metrics
     print("🧮 Computing Section 3 metrics…")
-    jit_df  = augment_jit(jit_df, fee_bps=args.fee_bps)
-    sand_df = augment_sandwich(sand_df, fee_bps=args.fee_bps, gamma=args.gamma, grid_n=args.grid_npoints)
-    rback_df = augment_reverse_backruns(rback_df, fee_bps=args.fee_bps)
+    jit_df  = augment_jit(jit_df, fee_bps=fee_bps)
+    sand_df = augment_sandwich(sand_df, fee_bps=fee_bps, gamma=args.gamma, grid_n=args.grid_npoints)
+    rback_df = augment_reverse_backruns(rback_df, fee_bps=fee_bps)
 
     # Save
     def save_csv(df_out: pd.DataFrame, name: str):

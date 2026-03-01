@@ -122,8 +122,6 @@ Troubleshooting
   through the supported routers/commands, or it’s an unsupported aggregator route.
 """
 
-# https://mainnet.infura.io/v3/5f38fb376e0548c8a828112252a6a588
-
 from __future__ import annotations
 import os
 import sys

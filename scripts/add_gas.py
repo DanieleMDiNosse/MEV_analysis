@@ -18,7 +18,7 @@ It:
 
 CLI
 ---
-python add_gas_fields.py \
+python scripts/add_gas.py \
   --in  /path/to/input.csv \
   --out /path/to/output.csv \
   --checkpoint /path/to/checkpoint.json \
@@ -30,12 +30,14 @@ import json
 import time
 import argparse
 import shutil
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-from web3 import Web3
-from eth_defi.provider.multi_provider import create_multi_provider_web3
+
+# Optional/heavy dependencies (`web3`, `eth_defi`) are imported lazily so that
+# `python scripts/add_gas.py --help` works even before installing them.
 
 
 # ---------------- Disk space guard ----------------
@@ -66,6 +68,8 @@ def _check_disk_space_for_path(path: str, min_free_ratio: float = MIN_FREE_RATIO
 # ---------------- RPC configuration ----------------
 def build_mainnet_config(urls, timeout=5.0) -> str:
     """Return a space-joined string of endpoints that respond on chain_id==1."""
+    from web3 import Web3
+
     ok = []
     for u in urls:
         try:
@@ -79,27 +83,40 @@ def build_mainnet_config(urls, timeout=5.0) -> str:
     return " ".join(ok)
 
 
-# DEFAULT_RPC_URLS = [
-#     "https://eth.llamarpc.com/sk_llama_252714c1e64c9873e3b21ff94d7f1a3f",
-#     "https://mainnet.infura.io/v3/5f38fb376e0548c8a828112252a6a588",
-#     "https://snowy-broken-spring.quiknode.pro/e1c35cbb709b1cb095d49e42dcd4d40e6cbbfd7a",
-#     "https://eth.rpc.grove.city/v1/887ffda2",
-#     "https://lb.nodies.app/v1/c6a2e72646e34fc78d95513a52c4aca6",
-# ]
-
 DEFAULT_RPC_URLS = [
-    "https://mainnet.infura.io/v3/5f38fb376e0548c8a828112252a6a588"
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth",
 ]
 
-JSON_RPC_LINE = build_mainnet_config(DEFAULT_RPC_URLS)
-w3 = create_multi_provider_web3(JSON_RPC_LINE, request_kwargs={"timeout": 30.0})
-assert w3.eth.chain_id == 1, "Connected chain is not Ethereum mainnet"
+def get_web3():
+    """
+    Create a Web3 instance with multi-endpoint failover.
+
+    Uses `MEV_RPC_URLS` (space-separated) or `WEB3_PROVIDER_URI` (single endpoint) if set;
+    otherwise probes `DEFAULT_RPC_URLS`.
+    """
+    from eth_defi.provider.multi_provider import create_multi_provider_web3
+
+    rpc_line = os.environ.get("MEV_RPC_URLS") or os.environ.get("WEB3_PROVIDER_URI")
+    if rpc_line and rpc_line.strip():
+        w3_local = create_multi_provider_web3(rpc_line.strip(), request_kwargs={"timeout": 30.0})
+    else:
+        rpc_line = build_mainnet_config(DEFAULT_RPC_URLS)
+        w3_local = create_multi_provider_web3(rpc_line, request_kwargs={"timeout": 30.0})
+    if w3_local.eth.chain_id != 1:
+        raise RuntimeError(f"Connected chain is not Ethereum mainnet (chain_id={w3_local.eth.chain_id}).")
+    return w3_local
+
+
+# Initialized in `main()` to keep `--help` working without optional deps installed.
+w3 = None
 
 
 # ---------------- Defaults (can be overridden via CLI) ----------------
-DEFAULT_INPUT_CSV = "data/usdc_weth_05.csv"
-DEFAULT_OUTPUT_CSV = "data/univ3_pool_events_with_gas.csv"
-DEFAULT_CHECKPOINT = "data/gas_fetch_checkpoint.json"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT_CSV = REPO_ROOT / "data" / "raw" / "usdc_weth_05.csv"
+DEFAULT_OUTPUT_CSV = REPO_ROOT / "data" / "processed" / "univ3_pool_events_with_gas.csv"
+DEFAULT_CHECKPOINT = REPO_ROOT / "data" / "checkpoints" / "gas_fetch_checkpoint.json"
 
 DEFAULT_BATCH_SIZE = 100
 DEFAULT_WORKERS = 1
@@ -186,6 +203,8 @@ def determine_work(df: pd.DataFrame) -> List[str]:
 # ---------------- RPC fetchers ----------------
 def fetch_tx_gas(tx_hash: str, retry_count: int = 3, backoff: float = 0.6) -> Dict[str, Optional[int]]:
     """Fetch gasUsed, gasPrice, effectiveGasPrice for a hash."""
+    if w3 is None:
+        raise RuntimeError("Web3 is not initialized. Run via `main()` or call `get_web3()` first.")
     if tx_hash in _tx_cache:
         return _tx_cache[tx_hash]
 
@@ -308,9 +327,9 @@ def add_gas_incremental(
 # ---------------- Main ----------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fill gasUsed / gasPrice / effectiveGasPrice via RPC")
-    p.add_argument("--in", dest="input_csv", default=DEFAULT_INPUT_CSV, help="Input CSV path")
-    p.add_argument("--out", dest="output_csv", default=DEFAULT_OUTPUT_CSV, help="Output CSV path")
-    p.add_argument("--checkpoint", dest="checkpoint", default=DEFAULT_CHECKPOINT, help="Checkpoint JSON path")
+    p.add_argument("--in", dest="input_csv", default=str(DEFAULT_INPUT_CSV), help="Input CSV path")
+    p.add_argument("--out", dest="output_csv", default=str(DEFAULT_OUTPUT_CSV), help="Output CSV path")
+    p.add_argument("--checkpoint", dest="checkpoint", default=str(DEFAULT_CHECKPOINT), help="Checkpoint JSON path")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
@@ -320,12 +339,15 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    input_csv = args.input_csv
-    output_csv = args.output_csv
-    checkpoint_path = args.checkpoint
+    input_csv = Path(args.input_csv)
+    output_csv = Path(args.output_csv)
+    checkpoint_path = Path(args.checkpoint)
     batch_size = args.batch_size
     workers = args.workers
     save_every = args.save_every
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("🚀 Starting gas fetch (incremental-safe) ...")
     print(f"📄 INPUT_CSV  = {input_csv}")
@@ -333,19 +355,25 @@ def main():
     print(f"🧷 CHECKPOINT = {checkpoint_path}")
     print(f"⚙️  batch={batch_size}  workers={workers}  save_every={save_every}")
 
+    # Initialize Web3 lazily (keeps `--help` working without optional deps installed).
+    global w3
+    w3 = get_web3()
+
     # Load checkpoint & cache
-    checkpoint = load_checkpoint(checkpoint_path)
+    checkpoint = load_checkpoint(str(checkpoint_path))
     global _tx_cache
     _tx_cache = checkpoint.get("tx_cache", {}) or {}
     if _tx_cache:
         print(f"♻️  Loaded cache with {len(_tx_cache)} tx entries")
 
     # Choose base dataframe
-    if os.path.exists(output_csv):
+    if output_csv.exists():
         print("📂 Found existing OUTPUT_CSV. Continuing to fill missing gas fields ...")
         df = pd.read_csv(output_csv)
     else:
         print("📂 No OUTPUT_CSV found. Loading INPUT_CSV and starting from scratch ...")
+        if not input_csv.exists():
+            raise SystemExit(f"Input CSV not found: {input_csv}")
         df = pd.read_csv(input_csv)
 
     ensure_gas_columns(df)
@@ -362,7 +390,7 @@ def main():
             print("✅ Nothing to do — all gas fields already present.")
             # Still write out (ensures unified schema)
             # Extra safety: ensure disk is okay before final write
-            _check_disk_space_for_path(output_csv)
+            _check_disk_space_for_path(str(output_csv))
             df.to_csv(output_csv, index=False)
             return
 
@@ -374,13 +402,13 @@ def main():
         workers=workers,
         save_every=save_every,
         start_index=start_index,
-        checkpoint_path=checkpoint_path,
-        output_csv=output_csv,
+        checkpoint_path=str(checkpoint_path),
+        output_csv=str(output_csv),
     )
 
     # Final save (guarded)
     print(f"\n💾 Saving CSV to {output_csv} ...")
-    _check_disk_space_for_path(output_csv)
+    _check_disk_space_for_path(str(output_csv))
     df.to_csv(output_csv, index=False)
 
     # Stats
@@ -401,8 +429,8 @@ def main():
     print("=" * 60)
 
     # Cleanup checkpoint
-    if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
         print("🧹 Checkpoint file removed")
 
 

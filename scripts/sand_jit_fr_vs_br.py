@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 JIT + Sandwich verification (both directions)
 
@@ -26,15 +28,55 @@ Outputs:
   - CSV with per-cycle results
 """
 
+import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:  # noqa: BLE001
+    plt = None
 
-# --- 1) Load data -------------------------------------------------------------
-# Change this path if needed
-PATH = Path("/home/danielemdn/Documents/repositories/ABM_Uni_v3/mev_out/jit_sandwich_tidy.csv")
-df = pd.read_csv(PATH)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def discover_default_sandwich_path() -> Path:
+    """Prefer current `mev_collect.py` output naming, with backward-compatible fallbacks."""
+    mev_out = REPO_ROOT / "mev_out"
+    candidates = [
+        mev_out / "sandwich_attacks_tidy_5.csv",
+        mev_out / "sandwich_attacks_tidy_5.0.csv",
+        mev_out / "sandwich_attacks_tidy.csv",
+        mev_out / "sandwich_attacks_tidy_None.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Verify q_BR_hat = -(q_FR - alpha*v) on (JIT-)sandwich rows.")
+    p.add_argument(
+        "--in",
+        dest="in_path",
+        default=str(discover_default_sandwich_path()),
+        help="Input tidy CSV (default: %(default)s).",
+    )
+    p.add_argument(
+        "--pattern-type",
+        default="JIT-Sandwich",
+        help="Optional filter on `pattern_type` (default: 'JIT-Sandwich'). Set empty to disable filtering.",
+    )
+    return p.parse_args()
+
+
+args = parse_args()
+path = Path(args.in_path)
+df = pd.read_csv(path, low_memory=False)
+if args.pattern_type and "pattern_type" in df.columns:
+    want = str(args.pattern_type).strip().lower()
+    df = df[df["pattern_type"].astype(str).str.strip().str.lower() == want].copy()
 
 # --- 2) Normalize the direction field ----------------------------------------
 # We standardize victim_dir to either "x_to_y" or "y_to_x".
@@ -52,8 +94,6 @@ alpha = pd.to_numeric(df["attacker_liq_share"], errors="coerce")
 
 # --- 4) Build q_FR, q_BR_obs, v in the victim’s *output* token ---------------
 # Pool-delta -> trader perspective: multiply by -1 (buy output token > 0)
-f = 0.0005
-r = 1 - f
 front_a1 = pd.to_numeric(df.get("front_a1", np.nan), errors="coerce")
 front_a0 = pd.to_numeric(df.get("front_a0", np.nan), errors="coerce")
 back_a1  = pd.to_numeric(df.get("back_a1",  np.nan), errors="coerce")
@@ -63,7 +103,7 @@ S0       = pd.to_numeric(df.get("S_net_token0", np.nan), errors="coerce")
 
 # Use vectorized selection per direction
 q_FR     = -np.where(is_xy, front_a1, front_a0)
-q_BR_obs = - np.where(is_xy, back_a1/r,  back_a0/r)
+q_BR_obs = -np.where(is_xy, back_a1, back_a0)
 v        = -np.where(is_xy, S1,       S0)
 
 # --- 5) Predicted back-run and tidy results ----------------------------------
@@ -134,7 +174,9 @@ for d, stats in by_dir.items():
         print(f"  {k}: {v_}")
 
 # --- 7) Plots ----------------------------------------------------------------
-if not res.empty:
+if plt is None:
+    print("[warn] matplotlib is not installed; skipping plots.")
+elif not res.empty:
     # Observed vs Predicted BR (with 45-degree line)
     plt.figure(figsize=(7, 6))
     plt.scatter(res["q_BR_hat"], res["q_BR_obs"], alpha=0.6)
@@ -154,4 +196,3 @@ if not res.empty:
     plt.ylabel("|q_FR| - |q_BR_obs|")
     plt.title("alpha × v vs |FR| - |BR|  (higher alpha×v ⇒ smaller BR)")
     plt.show()
-

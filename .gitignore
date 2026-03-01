@@ -205,3 +205,32 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Research data & outputs (keep out of git; store elsewhere or regenerate)
+data/**
+!data/**/
+!data/README.md
+!data/**/.gitkeep
+
+mev_out/**
+!mev_out/**/
+!mev_out/README.md
+!mev_out/**/.gitkeep
+
+# LaTeX build artifacts (keep sources; ignore build junk)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+paper/**/*.aux
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.fdb_latexmk
+paper/**/*.fls
+paper/**/*.log
+paper/**/*.synctex.gz
+
+# Paper PDFs are build outputs; keep a copy under docs/assets/ if you want it on Pages.
+paper/*.pdf

@@ -16,10 +16,10 @@ Outputs:
   • .png/.pdf → static image (requires kaleido)
 
 Usage (example):
-  python section3_empirical_plotly.py \
-    --in-jit ./mev_out/jit_cycles_tidy.csv \
-    --in-sand ./mev_out/sandwich_attacks_tidy.csv \
-    --in-backrun ./mev_out/reverse_backruns_tidy.csv \
+  python scripts/section3_empirical.py \
+    --in-jit ./mev_out/jit_cycles_tidy_5.csv \
+    --in-sand ./mev_out/sandwich_attacks_tidy_5.csv \
+    --in-backrun ./mev_out/reverse_backruns_tidy_5.csv \
     --color-top-origins-jit 10 --color-top-origins-sand 30 \
     --legend-max-origins 25 \
     --out ./mev_out/section3_profit_vs_sigma.html \
@@ -28,12 +28,11 @@ Usage (example):
 from __future__ import annotations
 import os
 import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# We reuse matplotlib just to sample the same categorical colormaps
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+import colorsys
 
 import plotly.graph_objects as go
 
@@ -50,19 +49,32 @@ def _sigma(series: pd.Series, use_abs: bool) -> pd.Series:
     s = pd.to_numeric(series, errors='coerce')
     return s.abs() if use_abs else s
 
+def discover_tidy_path(mev_out: Path, stem: str) -> Path:
+    """Prefer current `mev_collect.py` outputs, but keep backward-compatible fallbacks."""
+    candidates = [
+        mev_out / f'{stem}_5.csv',
+        mev_out / f'{stem}_5.0.csv',
+        mev_out / f'{stem}.csv',
+        mev_out / f'{stem}_None.csv',
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
 # ---------------- Series builders ----------------
 
 def prepare_jit(df_jit: pd.DataFrame, use_abs_sigma: bool) -> pd.DataFrame:
-    """(σ, y, label, origin, under_threshold=False) for JIT fee ceiling in token0 units."""
+    """(σ, y, label, origin, under_threshold=False) for realized JIT PnL in token0 units."""
     if df_jit.empty:
         return df_jit
     if 'sigma_gross' not in df_jit.columns:
         raise ValueError("Expected 'sigma_gross' in JIT tidy file.")
-    if 'mmax_JIT_per_x0' not in df_jit.columns:
-        raise ValueError("Expected 'mmax_JIT_per_x0' in JIT tidy file.")
+    if 'profit_total_per_x0' not in df_jit.columns:
+        raise ValueError("Expected 'profit_total_per_x0' in JIT tidy file.")
 
     x = _sigma(df_jit['sigma_gross'], use_abs_sigma)
-    y = pd.to_numeric(df_jit['mmax_JIT_per_x0'], errors='coerce')
+    y = pd.to_numeric(df_jit['profit_total_per_x0'], errors='coerce')
     origin = df_jit['origin'].astype(str) if 'origin' in df_jit.columns else '(unknown)'
     out = pd.DataFrame({'sigma': x, 'y': y, 'label': 'JIT', 'origin': origin, 'under_threshold': False})
     return out.replace([np.inf, -np.inf], np.nan).dropna()
@@ -132,18 +144,20 @@ def summarize(series: pd.Series, name: str) -> None:
 # ---------------- Color/Marker helpers ----------------
 
 def build_origin_color_map(origins: pd.Series) -> dict:
-    """Return a {origin: hexcolor} mapping using matplotlib categorical colormaps (tab10/tab20/gist_ncar)."""
+    """Return a {origin: hexcolor} mapping (deterministic HSV palette; no matplotlib dependency)."""
     cats = pd.Index(pd.Series(origins).dropna().astype(str).unique())
     n = len(cats)
     if n == 0:
         return {}
-    if n <= 10:
-        cmap = plt.get_cmap('tab10', n)
-    elif n <= 20:
-        cmap = plt.get_cmap('tab20', n)
-    else:
-        cmap = plt.get_cmap('gist_ncar', n)
-    return {cats[i]: mcolors.to_hex(cmap(i)) for i in range(n)}
+
+    # Use a stable HSV sweep for distinct colors; keep saturation/value moderate for readability.
+    colors = []
+    for i in range(n):
+        h = (i / max(1, n)) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, 0.65, 0.90)
+        colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+
+    return {cats[i]: colors[i] for i in range(n)}
 
 PLOTLY_MARKERS = {
     'JIT': 'circle',
@@ -153,12 +167,6 @@ PLOTLY_MARKERS = {
 }
 
 def filter_self_funded(df: pd.DataFrame) -> pd.DataFrame:
-    fee_bps = df.get('fee_bps')
-    if fee_bps is None:
-        fee_bps = pd.Series(5.0, index=df.index)
-    f = fee_bps.astype(float) / 10_000.0
-    r = 1.0 - f
-
     dec0 = df.get('token0_decimals')
     if dec0 is None:
         dec0 = df.get('dec0')
@@ -181,8 +189,9 @@ def filter_self_funded(df: pd.DataFrame) -> pd.DataFrame:
     front_dir = df['front_dir'].astype(str).to_numpy()
     is_x2y = front_dir == 'swap_x2y'
 
-    diff_token1 = (ba1 / r) / (10.0 ** dec1) - (fa1 / (10.0 ** dec1))
-    diff_token0 = (ba0 / r) / (10.0 ** dec0) - (fa0 / (10.0 ** dec0))
+    # NOTE: Swap `amount0/amount1` are *gross* pool deltas (not divided by `r`).
+    diff_token1 = (ba1 / (10.0 ** dec1)) - (fa1 / (10.0 ** dec1))
+    diff_token0 = (ba0 / (10.0 ** dec0)) - (fa0 / (10.0 ** dec0))
     diff_tokens = np.where(is_x2y, diff_token1, diff_token0)
 
     rtol = 2e-6
@@ -196,15 +205,21 @@ def filter_self_funded(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------- Main ----------------
 
 def main():
+    repo_root = Path(__file__).resolve().parents[1]
+    mev_out = repo_root / "mev_out"
+    default_jit = discover_tidy_path(mev_out, 'jit_cycles_tidy')
+    default_sand = discover_tidy_path(mev_out, 'sandwich_attacks_tidy')
+    default_br = discover_tidy_path(mev_out, 'reverse_backruns_tidy')
+
     ap = argparse.ArgumentParser(
-        description='Plotly scatter: profit vs |σ| for JIT ceiling and realized Sandwich PnL — colored by origin.'
+        description='Plotly scatter: profit vs |σ| for realized JIT/Sandwich/Back-run PnL — colored by origin.'
     )
-    ap.add_argument('--in-jit',  default='./mev_out/jit_cycles_tidy.csv', help='Path to jit_cycles_tidy_0.0005.csv')
-    ap.add_argument('--in-sand', default='./mev_out/sandwich_attacks_tidy.csv', help='Path to sandwich_attacks_tidy_0.0005.csv')
-    ap.add_argument('--in-backrun', default='./mev_out/reverse_backruns_tidy.csv', help='Path to reverse_backruns_tidy_0.0005.csv')
+    ap.add_argument('--in-jit', default=str(default_jit), help='Path to JIT tidy CSV (default: %(default)s).')
+    ap.add_argument('--in-sand', default=str(default_sand), help='Path to sandwich tidy CSV (default: %(default)s).')
+    ap.add_argument('--in-backrun', default=str(default_br), help='Path to reverse back-run tidy CSV (default: %(default)s).')
 
     ap.add_argument('--color-top-origins', type=int, default=3,
-                    help='Fallback N used for both groups if group-specific values are not provided. Default: 15')
+                    help='Fallback N used for both groups if group-specific values are not provided. Default: 3')
     ap.add_argument('--color-top-origins-jit', type=int, default=None,
                     help='Highlight top-N origins among JIT attacks. Overrides --color-top-origins for JIT.')
     ap.add_argument('--color-top-origins-sand', type=int, default=None,
@@ -212,7 +227,7 @@ def main():
     ap.add_argument('--legend-max-origins', type=int, default=None,
                     help='Optional cap for number of highlighted origins shown in the legend. Default: all highlighted.')
 
-    ap.add_argument('--out', default='./mev_out/section3_profit_vs_sigma.html', help='Output path (.html for interactive, or .png/.pdf if kaleido is installed)')
+    ap.add_argument('--out', default=str(mev_out / 'section3_profit_vs_sigma.html'), help='Output path (.html for interactive, or .png/.pdf if kaleido is installed)')
     ap.add_argument('--show', action='store_true', help='Open the plot in a browser after saving.')
     args = ap.parse_args()
 
@@ -229,7 +244,7 @@ def main():
     frames = []
     jit = prepare_jit(jit_df, True)
     if not jit.empty:
-        summarize(jit['y'], 'JIT ceiling y')
+        summarize(jit['y'], 'JIT y')
         frames.append(jit)
 
     sand_class = prepare_sandwich_classical(classical_sand, True)
@@ -237,6 +252,7 @@ def main():
     if not sand_class.empty:
         summarize(sand_class['y'], 'Classical Sandwich y')
         frames.append(sand_class)
+    if not sand_jit.empty:
         summarize(sand_jit['y'], 'JIT-Sandwich y')
         frames.append(sand_jit)
 
