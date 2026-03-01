@@ -67,10 +67,14 @@ $$
 
 `scripts/data_fetch.py` fetches `Swap`, `Mint`, and `Burn` logs for a single Uniswap v3 pool over a time range and writes a per-event CSV. It also derives “running state” columns such as `L_before` and `sqrt_before` by walking the event stream in strict `(blockNumber, logIndex)` order.
 
-Optional enrichments:
+- `scripts/data_fetch.py` also resolves **transaction metadata**:
+  - `origin` (tx sender) is **always** fetched via `eth_getTransaction`
+  - gas fields (`gasUsed`, `gasPrice`, `effectiveGasPrice`) are fetched **by default** via receipts; set `SKIP_GAS_DATA = True` in `scripts/data_fetch.py` to skip (much faster)
 
-- `scripts/add_origin.py`: resolves `origin` (tx sender) via `eth_getTransaction`
-- `scripts/add_gas.py`: resolves `gasUsed`, `gasPrice`, `effectiveGasPrice` via `eth_getTransactionReceipt` / `eth_getTransaction`
+Optional / post-processing enrichments:
+
+- `scripts/add_origin.py`: backfill `origin` for an existing CSV (e.g., external dataset)
+- `scripts/add_gas.py`: backfill `gasUsed`, `gasPrice`, `effectiveGasPrice` for an existing CSV
 - `scripts/fetch_slippage_from_tx.py`: decodes swap calldata and quotes pre-trade expectations (QuoterV2 at `block-1`) to estimate implied slippage tolerance
 
 ### 2) MEV pattern detection (single pool, strict adjacency)
@@ -108,15 +112,15 @@ To compute normalized sizes (`sigma_gross`, etc.) and theory-side metrics, you a
 
 Notes:
 
-- If you start from an external event CSV (no `origin` / no running state), use `scripts/add_origin.py` and ensure you have `L_before`/`sqrt_before` computed; otherwise the detectors may find zero patterns and/or produce `NaN` theory fields.
+- If you start from an external event CSV, you must have `origin` and running-state (`L_before`/`sqrt_before`) fields; otherwise the detectors may find zero patterns and/or produce `NaN` theory fields. If needed, use `scripts/add_origin.py` (and ensure running state is computed).
 - Because blocks are scanned in parallel, **output row order is not guaranteed**. Sort the tidy outputs downstream if you need stable ordering.
 
 ## Repository entry points
 
 The repo is script-first (not a packaged library). The main entry points:
 
-- `scripts/data_fetch.py`: fetch pool events and running state to CSV (writes under `data/`)
-- `scripts/add_origin.py`, `scripts/add_gas.py`: incrementally enrich the dataset (writes under `data/`)
+- `scripts/data_fetch.py`: fetch pool events + running state + tx metadata (`origin` always; gas fields by default) to CSV (writes under `data/`)
+- `scripts/add_origin.py`, `scripts/add_gas.py`: backfill those metadata fields for an existing CSV (writes under `data/`)
 - `scripts/mev_collect.py`: detect patterns + compute theory fields; writes “tidy” CSVs to `mev_out/`
 - `scripts/section3_empirical_simple.py`: Plotly scatter of profit vs `|σ|` by strategy
 - `scripts/section3_empirical.py`: Plotly scatter with origin coloring / highlighting
@@ -142,6 +146,8 @@ python scripts/data_fetch.py
 This writes a CSV like `data/raw/univ3_<POOL_ADDR>.csv` and a resume checkpoint under `data/checkpoints/`.
 
 ### 2) Optional: add origin / gas
+
+Note: current `scripts/data_fetch.py` already writes `origin` by default and fetches gas fields unless `SKIP_GAS_DATA = True`. Use `scripts/add_origin.py` / `scripts/add_gas.py` only if you’re enriching an existing CSV (or backfilling after skipping gas).
 
 Both `scripts/add_origin.py` and `scripts/add_gas.py` support incremental resume via checkpoints. Defaults are repo-relative; use CLI flags to override.
 

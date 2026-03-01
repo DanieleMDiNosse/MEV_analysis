@@ -116,7 +116,7 @@ POOL_ADDR = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"  # USDC/WETH 0.05%
 
 # Provide either UNIX seconds or ISO strings (UTC assumed unless offset specified)
 START_TS: Union[int, str] = "2023-01-01T00:00:00Z"
-END_TS:   Union[int, str] = "2023-12-31T23:59:59Z"
+END_TS:   Union[int, str] = "2024-12-31T23:59:59Z"
 
 # OPTIMIZED: Adaptive chunks, parallel processing
 CHUNK_SIZE_BLOCKS = 500  # Reduced to avoid provider limits
@@ -423,7 +423,7 @@ def get_logs_chunked_any(topics_any: List[str], start_block: int, end_block: int
             yield from yield_range(cur, to_blk)
         except Exception as e:
             print(f"  ⚠️  Error in range {cur}-{to_blk}: {str(e)[:100]}")
-            smaller_chunk = max(CHUNK_SIZE_BLOCKS // 4, 100)
+            smaller_chunk = max(CHUNK_SIZE_BLOCKS // 4, 10)
             inner_cur = cur
             while inner_cur <= to_blk:
                 inner_end = min(inner_cur + smaller_chunk - 1, to_blk)
